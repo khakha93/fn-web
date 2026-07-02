@@ -49,7 +49,7 @@ def merge_dividend_data(df_price, df_com):
         dfs_max=('dfs', 'max'),)
 
     # 다시 정보 취합
-    df_left = df_merge[['Date', ticker, 'period', 'start_date', 'end_date', 'adj_div', 'dfs']].reset_index(drop=True)
+    df_left = df_merge[['Date', ticker, 'period', 'start_date', 'end_date', 'adj_div', 'dfs', 'div_change']].reset_index(drop=True)
     df_right = dfs_agg.shift(1).loc[df_merge['period']].reset_index(drop=True)
     df_stat = pd.concat([df_left, df_right], axis=1)
 

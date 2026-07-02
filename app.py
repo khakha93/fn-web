@@ -5,10 +5,19 @@ import plotly.graph_objects as px
 from plotly.subplots import make_subplots
 import div_yf as dyf
 
-st.title("나의 고유 지표 주가 대시보드")
+st.title("미국 배당주 모니터링")
 
 # 1. 자산 및 기간 선택 UI
-ticker = st.text_input("티커 입력", "QCOM")
+col1, col2 = st.columns([5, 1])
+with col1:
+    ticker = st.text_input("티커 입력", "").strip()
+with col2:
+    st.markdown("<div style='padding-top: 28px;'></div>", unsafe_allow_html=True)
+    st.button("조회", use_container_width=True)
+
+if not ticker:
+    st.info("차트를 조회하려면 티커를 입력해주세요. (예: QCOM, AAPL, TSLA)")
+    st.stop()
 
 # 2. 데이터 가져오기
 df_price = yf.download(ticker, period="max", auto_adjust=False)
@@ -81,6 +90,10 @@ df_stat_filtered = df_stat[
     (df_stat['Date'] >= pd.to_datetime(start_date)) & 
     (df_stat['Date'] <= pd.to_datetime(end_date))
 ]
+df_com_filtered = df_com[
+    (df_com['start_date'] >= pd.to_datetime(start_date)) & 
+    (df_com['start_date'] <= pd.to_datetime(end_date))
+].copy()
 
 # 우측 버퍼(5%)를 데이터 자체에 강제로 공백 행(NaN)으로 주입하여 
 # rangeselector(기간 선택 버튼) 및 double-click 리셋 기능과의 충돌(여백 초기화 현상)을 완벽히 해결합니다.
@@ -91,27 +104,41 @@ if not df_filtered.empty:
     buffer_date = end_dt + time_buffer
     
     # 주가 데이터프레임 복사 후 마지막에 NaN값을 가지는 버퍼 날짜 행 추가
-    df_filtered_buffered = df_filtered.copy()
-    df_filtered_buffered.loc[buffer_date] = [None] * len(df_filtered.columns)
-    df_filtered_buffered = df_filtered_buffered.sort_index()
+    last_row = df_filtered.tail(1).copy()
+    last_row.index = [buffer_date]
+    last_row.iloc[0] = None
+    df_filtered_buffered = pd.concat([df_filtered, last_row]).sort_index()
     
-    # 배당 데이터프레임 복사 후 마지막에 Date만 채워진 행 추가 (.loc 사용으로 pd.concat 경고 우회)
-    df_stat_filtered_buffered = df_stat_filtered.copy()
-    next_idx = len(df_stat_filtered_buffered)
-    df_stat_filtered_buffered.loc[next_idx] = [None] * len(df_stat_filtered_buffered.columns)
-    df_stat_filtered_buffered.loc[next_idx, 'Date'] = buffer_date
+    # 배당 데이터프레임 복사 후 마지막에 Date만 채워진 행 추가
+    if not df_stat_filtered.empty:
+        last_row_stat = df_stat_filtered.tail(1).copy()
+        last_row_stat.index = [len(df_stat_filtered)]
+        last_row_stat.iloc[0] = None
+        last_row_stat.loc[last_row_stat.index[0], 'Date'] = buffer_date
+        df_stat_filtered_buffered = pd.concat([df_stat_filtered, last_row_stat], ignore_index=True)
+    else:
+        new_row_stat = pd.DataFrame(columns=df_stat_filtered.columns, index=[0])
+        new_row_stat.loc[0, 'Date'] = buffer_date
+        df_stat_filtered_buffered = pd.concat([df_stat_filtered, new_row_stat], ignore_index=True)
+        
     df_stat_filtered_buffered = df_stat_filtered_buffered.sort_values('Date').reset_index(drop=True)
 else:
     df_filtered_buffered = df_filtered
     df_stat_filtered_buffered = df_stat_filtered
 
-# 5. Plotly를 이용한 HTS식 레이어 차트 그리기 (2단 분할 차트)
+# 5. Plotly를 이용한 HTS식 레이어 차트 그리기 (5단 분할 차트)
 fig = make_subplots(
-    rows=2, cols=1,
+    rows=5, cols=1,
     shared_xaxes=True,
-    vertical_spacing=0.15,
-    subplot_titles=(f"{ticker} 주가 (종가)", "배당수익률(DFS)"),
-    row_heights=[0.5, 0.5]
+    vertical_spacing=0.07,
+    subplot_titles=(
+        f"{ticker} 주가 (종가)", 
+        "배당수익률(DFS)", 
+        "배당금 (Adjusted Dividend)", 
+        "배당 성장률 (Dividend Growth)",
+        "주가 비교 (Close vs Adj Close)"
+    ),
+    row_heights=[0.2, 0.2, 0.2, 0.2, 0.2]
 )
 
 # 기본 주가 캔들스틱 (또는 라인) 추가 (버퍼가 적용된 데이터 사용)
@@ -124,6 +151,60 @@ fig.add_trace(
 fig.add_trace(
     px.Scatter(x=df_stat_filtered_buffered.Date, y=df_stat_filtered_buffered['dfs'], name="배당수익률(DFS)", line=dict(color='firebrick', width=1, dash='solid')),
     row=2, col=1
+)
+
+# 3단: 배당금 (Adjusted Dividend) - 단계형 선(step line)으로 구성
+fig.add_trace(
+    px.Scatter(
+        x=df_stat_filtered_buffered.Date, 
+        y=df_stat_filtered_buffered['adj_div'], 
+        name="배당금 ($)", 
+        line=dict(color='darkorange', width=1.5, shape='hv')
+    ),
+    row=3, col=1
+)
+
+# 4단: 배당 성장률 (div_change) - 단계형 영역 차트(Step Area Chart)로 구성
+fig.add_trace(
+    px.Scatter(
+        x=df_stat_filtered_buffered.Date,
+        y=df_stat_filtered_buffered['div_change'] * 100,
+        name="배당 성장률 (%)",
+        line=dict(color='rgba(46, 204, 113, 1)', width=1.5, shape='hv'),
+        fill='tozeroy',
+        fillcolor='rgba(46, 204, 113, 0.15)'  # 반투명 초록색으로 하단 영역 채움
+    ),
+    row=4, col=1
+)
+
+# 5단: 주가 비교 (Close vs Adj Close)
+fig.add_trace(
+    px.Scatter(
+        x=df_filtered_buffered.index, 
+        y=df_filtered_buffered['Close'], 
+        name="Close", 
+        line=dict(color='royalblue', width=1)
+    ),
+    row=5, col=1
+)
+fig.add_trace(
+    px.Scatter(
+        x=df_filtered_buffered.index, 
+        y=df_filtered_buffered['Adj Close'], 
+        name="Adj Close", 
+        line=dict(color='limegreen', width=1)
+    ),
+    row=5, col=1
+)
+
+# 0% 기준선(점선) 추가
+fig.add_hline(
+    y=0,
+    line_dash="dash",
+    line_color="rgba(255, 255, 255, 0.3)",
+    line_width=1,
+    row=4,
+    col=1
 )
 
 # 6. 배당 지급일 및 배당 주기 변경일에 보조선(수직선) 추가
@@ -166,7 +247,7 @@ if not df_div_period.empty and 'Date' in df_div_period.columns and 'period' in d
             color="rgba(128, 128, 128, 0.4)"
         )
         
-        # Row 1 (상단 주가 그래프) 세로선 추가 - y domain (0~1) 지정하여 공백 제거
+        # Row 1 세로선
         fig.add_shape(
             type="line",
             x0=date_val_dt, x1=date_val_dt,
@@ -177,13 +258,46 @@ if not df_div_period.empty and 'Date' in df_div_period.columns and 'period' in d
             layer="below"
         )
         
-        # Row 2 (하단 배당수익률 그래프) 세로선 추가 - y2 domain (0~1) 지정하여 공백 제거
+        # Row 2 세로선
         fig.add_shape(
             type="line",
             x0=date_val_dt, x1=date_val_dt,
             y0=0, y1=1,
             xref="x2",
             yref="y2 domain",
+            line=line_style,
+            layer="below"
+        )
+
+        # Row 3 세로선
+        fig.add_shape(
+            type="line",
+            x0=date_val_dt, x1=date_val_dt,
+            y0=0, y1=1,
+            xref="x3",
+            yref="y3 domain",
+            line=line_style,
+            layer="below"
+        )
+
+        # Row 4 세로선
+        fig.add_shape(
+            type="line",
+            x0=date_val_dt, x1=date_val_dt,
+            y0=0, y1=1,
+            xref="x4",
+            yref="y4 domain",
+            line=line_style,
+            layer="below"
+        )
+
+        # Row 5 세로선
+        fig.add_shape(
+            type="line",
+            x0=date_val_dt, x1=date_val_dt,
+            y0=0, y1=1,
+            xref="x5",
+            yref="y5 domain",
             line=line_style,
             layer="below"
         )
@@ -208,24 +322,99 @@ if not df_div_period.empty and 'Date' in df_div_period.columns and 'period' in d
 
 # 차트 레이아웃 조정 (HTS 느낌 내기)
 fig.update_layout(
-    title=f"{ticker} 주가 및 배당수익률 트렌드",
+    title=dict(
+        text=f"{ticker} 주가 및 배당 트렌드 분석",
+        x=0.5,
+        xanchor="center",
+        y=0.99,
+        yanchor="top"
+    ),
     hovermode="x", # 마우스를 올리면 같은 날짜의 모든 지표를 한눈에 보여줌 (HTS 핵심 기능)
     template="plotly_dark", # 어두운 HTS 테마 느낌
-    height=800, # 2단 분할이므로 높이를 충분히 확보
-    legend=dict(
-        orientation="h",      # 범례를 가로 방향으로 배치
-        yanchor="bottom",
-        y=1.02,               # 차트 위쪽 배치
-        xanchor="right",
-        x=1                   # 우측 정렬
-    ),
-    margin=dict(l=50, r=20, t=80, b=50) # 범례가 빠져나간 만큼 우측 여백을 최소화하여 차트 가로 너비를 극대화
+    height=2500, # 5단 분할이므로 높이를 충분히 확보
+    showlegend=False, # 전체 범례를 숨기고 개별 그래프 내부에 표시
+    margin=dict(l=50, r=20, t=110, b=50) # 여백을 조정하여 타이틀과 버튼 영역 확보
+)
+
+# 서브플롯 제목들의 폰트 크기 및 위치 조정 (위쪽 겹침을 방지하기 위해 조금만 위로 띄움)
+for annotation in fig.layout.annotations:
+    annotation.font.size = 12
+    annotation.y = annotation.y + 0.007
+
+# 7. 각 서브플롯 내부 좌측 상단에 개별 범례(Legend) 표시 (HTS 스타일)
+fig.add_annotation(
+    text="<span style='color:royalblue'>■</span> 주가 (종가)",
+    xref="x domain", yref="y domain",
+    x=0.01, y=0.95,
+    showarrow=False,
+    font=dict(size=11, color="white"),
+    bgcolor="rgba(30, 30, 30, 0.75)",
+    bordercolor="rgba(128, 128, 128, 0.3)",
+    borderwidth=1,
+    borderpad=4,
+    xanchor="left", yanchor="top",
+    row=1, col=1
+)
+fig.add_annotation(
+    text="<span style='color:firebrick'>■</span> 배당수익률(DFS)",
+    xref="x2 domain", yref="y2 domain",
+    x=0.01, y=0.95,
+    showarrow=False,
+    font=dict(size=11, color="white"),
+    bgcolor="rgba(30, 30, 30, 0.75)",
+    bordercolor="rgba(128, 128, 128, 0.3)",
+    borderwidth=1,
+    borderpad=4,
+    xanchor="left", yanchor="top",
+    row=2, col=1
+)
+fig.add_annotation(
+    text="<span style='color:darkorange'>■</span> 배당금 ($)",
+    xref="x3 domain", yref="y3 domain",
+    x=0.01, y=0.95,
+    showarrow=False,
+    font=dict(size=11, color="white"),
+    bgcolor="rgba(30, 30, 30, 0.75)",
+    bordercolor="rgba(128, 128, 128, 0.3)",
+    borderwidth=1,
+    borderpad=4,
+    xanchor="left", yanchor="top",
+    row=3, col=1
+)
+fig.add_annotation(
+    text="<span style='color:rgba(46, 204, 113, 1)'>■</span> 배당 성장률 (%)",
+    xref="x4 domain", yref="y4 domain",
+    x=0.01, y=0.95,
+    showarrow=False,
+    font=dict(size=11, color="white"),
+    bgcolor="rgba(30, 30, 30, 0.75)",
+    bordercolor="rgba(128, 128, 128, 0.3)",
+    borderwidth=1,
+    borderpad=4,
+    xanchor="left", yanchor="top",
+    row=4, col=1
+)
+fig.add_annotation(
+    text="<span style='color:royalblue'>■</span> Close &nbsp;&nbsp;&nbsp;&nbsp; <span style='color:limegreen'>■</span> Adj Close",
+    xref="x5 domain", yref="y5 domain",
+    x=0.01, y=0.95,
+    showarrow=False,
+    font=dict(size=11, color="white"),
+    bgcolor="rgba(30, 30, 30, 0.75)",
+    bordercolor="rgba(128, 128, 128, 0.3)",
+    borderwidth=1,
+    borderpad=4,
+    xanchor="left", yanchor="top",
+    row=5, col=1
 )
 
 # 각 서브플롯의 y축 및 x축 제목 설정 (y축 줌 고정 포함)
 fig.update_yaxes(title_text="가격 ($)", fixedrange=True, row=1, col=1)
 fig.update_yaxes(title_text="배당수익률(DFS)", fixedrange=True, row=2, col=1)
-fig.update_xaxes(title_text="날짜", row=2, col=1)
+fig.update_yaxes(title_text="배당금 ($)", fixedrange=True, row=3, col=1)
+fig.update_yaxes(title_text="배당 성장률 (%)", fixedrange=True, row=4, col=1)
+fig.update_yaxes(title_text="주가 비교 ($)", fixedrange=True, row=5, col=1)
+fig.update_xaxes(title_text="날짜", row=5, col=1)
 
 # x축 및 y축 선을 표시하도록 설정 (테두리 박스가 아닌 단일 축 선으로 설정)
 fig.update_xaxes(
@@ -253,7 +442,7 @@ fig.update_xaxes(
     hoverformat="%Y-%m-%d"  # 날짜 표시 형식 설정 (예: 2025-03-15)
 )
 
-# 하단 메인 차트(row=2, col=1)의 X축에 범위 선택 버튼(Rangeselector) 추가 (matches="x2"에 따른 줌 동작 활성화)
+# 하단 메인 차트(row=5, col=1)의 X축에 범위 선택 버튼(Rangeselector) 추가 (matches="x5"에 따른 줌 동작 활성화)
 fig.update_xaxes(
     rangeselector=dict(
         buttons=list([
@@ -271,7 +460,7 @@ fig.update_xaxes(
         xanchor="left",
         yanchor="bottom"
     ),
-    row=2, col=1
+    row=5, col=1
 )
 fig.update_yaxes(
     showspikes=True,
