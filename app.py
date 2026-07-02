@@ -10,9 +10,12 @@ from plotly.subplots import make_subplots
 st.title("미국 배당주 모니터링")
 
 # 1. 자산 및 기간 선택 UI
+# 입력창에 소문자를 타이핑해도 화면에 자동으로 대문자로 표시되도록 CSS 적용
+st.markdown("<style>input { text-transform: uppercase; }</style>", unsafe_allow_html=True)
+
 col1, col2 = st.columns([5, 1])
 with col1:
-    ticker = st.text_input("티커 입력", "").strip()
+    ticker = st.text_input("티커 입력", "").strip().upper()
 with col2:
     st.markdown("<div style='padding-top: 28px;'></div>", unsafe_allow_html=True)
     st.button("조회", use_container_width=True)
@@ -325,7 +328,7 @@ if not df_div_period.empty and 'Date' in df_div_period.columns and 'period' in d
 # 차트 레이아웃 조정 (HTS 느낌 내기)
 fig.update_layout(
     title=dict(
-        text=f"{ticker} 주가 및 배당 트렌드 분석",
+        text=f"{ticker} 주가 및 배당 분석",
         x=0.5,
         xanchor="center",
         y=0.99,
