@@ -25,7 +25,8 @@ with col2:
     st.button("조회", use_container_width=True)
 
 if not ticker:
-    st.info("차트를 조회하려면 티커를 입력해주세요. (예: QCOM, AAPL, TSLA)")
+    st.info("차트를 조회하려면 티커를 입력해주세요. (예: QCOM, KO, PG)")
+    st.info("배당금이 없으면 조회가 안 됩니다. 향후 조회 가능한 목록을 제공할 예정")
     st.stop()
 
 @st.cache_data
