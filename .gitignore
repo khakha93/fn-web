@@ -3,6 +3,13 @@ test.*
 
 # data
 *.csv
+# 개발 계획 메모
+docs/
+
+# Credentials
+google_key.json
+.streamlit/
+
 
 
 # Byte-compiled / optimized / DLL files

@@ -1,116 +1,141 @@
 import div_yf as dyf
-
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 import warnings
+import plotly.graph_objects as px
+from plotly.subplots import make_subplots
+import sheets_helper as sh
 
 # Streamlit/yfinance 내부 expire_cache 관련 비동기 RuntimeWarning 무시
 warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*expire_cache.*")
 
-import plotly.graph_objects as px
-from plotly.subplots import make_subplots
+# 앱 기동 시 구글 시트 테이블 초기화
+sh.init_sheets()
 
-st.title("미국 배당주 모니터링")
+# Session State를 이용한 메뉴 및 기본 티커 상태 초기화
+if "menu" not in st.session_state:
+    st.session_state.menu = "📊 개별 종목 분석"
+if "ticker" not in st.session_state:
+    st.session_state.ticker = ""  # 기본값으로 코카콜라(KO) 설정
 
-# 1. 자산 및 기간 선택 UI
-# 입력창에 소문자를 타이핑해도 화면에 자동으로 대문자로 표시되도록 CSS 적용
-st.markdown("<style>input { text-transform: uppercase; }</style>", unsafe_allow_html=True)
+# 사이드바 네비게이션 구성
+st.sidebar.title("💰 배당 모니터링 시스템")
+menu_options = ["📊 개별 종목 분석", "📋 전체 종목 리스트", "💼 내 자산 & 관심 종목"]
+default_menu_index = menu_options.index(st.session_state.menu) if st.session_state.menu in menu_options else 0
 
-col1, col2 = st.columns([5, 1])
-with col1:
-    ticker = st.text_input("티커 입력", "").strip().upper()
-with col2:
-    st.markdown("<div style='padding-top: 28px;'></div>", unsafe_allow_html=True)
-    st.button("조회", use_container_width=True)
+selected_menu = st.sidebar.radio(
+    "메뉴 선택",
+    menu_options,
+    index=default_menu_index
+)
 
-if not ticker:
-    st.info("차트를 조회하려면 티커를 입력해주세요. (예: QCOM, KO, PG)")
-    st.info("배당금이 없으면 조회가 안 됩니다. 향후 조회 가능한 목록을 제공할 예정")
-    st.stop()
+# 사용자 클릭으로 메뉴가 바뀐 경우 동기화
+if selected_menu != st.session_state.menu:
+    st.session_state.menu = selected_menu
+    st.rerun()
 
-@st.cache_data
-def get_stock_data(ticker):
-    # 2. 데이터 가져오기
-    df_price = yf.download(ticker, period="max", auto_adjust=False)
-    df_close = df_price['Close'].copy()
+# 1. 개별 종목 분석 페이지
+if st.session_state.menu == "📊 개별 종목 분석":
+    st.markdown("<style>input { text-transform: uppercase; }</style>", unsafe_allow_html=True)
     
-    # 단일 티커 검색 시 MultiIndex 컬럼일 경우 평탄화
-    if isinstance(df_price.columns, pd.MultiIndex):
-        df_price.columns = df_price.columns.droplevel(1)
-
-    # 3. 배당수익률 지표 계산 로직
-    df_div = dyf.get_yf_dividend_history(ticker)
-    df_div_period = dyf.add_period_columns_by_div(df_div)
-    df_com = dyf.group_by_period_by_div(df_div_period)
-    _, df_stat = dyf.merge_dividend_data(df_close, df_com)
-    
-    # 데이터의 날짜 범위 확인 (timezone 제거하여 일치시킴)
-    df_price.index = df_price.index.tz_localize(None)
-    df_stat['Date'] = pd.to_datetime(df_stat['Date']).dt.tz_localize(None)
-    
-    return df_price, df_stat, df_div_period, df_com
-
-df_price, df_stat, df_div_period, df_com = get_stock_data(ticker)
-
-min_date = df_price.index.min().to_pydatetime().date()
-max_date = df_price.index.max().to_pydatetime().date()
-
-# 기본 조회 범위를 2010년 10월 1일로 설정 (데이터 시작일이 그보다 늦은 경우 데이터 시작일로 대체)
-default_start = max(min_date, pd.to_datetime("2010-01-01").date())
-
-# Session State를 이용한 시작일/종료일 상태 초기화
-if "start_date" not in st.session_state:
-    st.session_state.start_date = default_start
-if "end_date" not in st.session_state:
-    st.session_state.end_date = max_date
-
-# 상세 기간 설정용 expander 추가 (모바일 화면 최적화)
-with st.expander("📅 상세 기간 직접 설정 (날짜 지정)", expanded=False):
-    # st.form을 사용하여 날짜 입력이 모두 완료되고 "조회" 버튼을 클릭할 때만 재로딩되도록 구성
-    with st.form(key="date_range_form"):
-        col1, col2 = st.columns(2)
-        with col1:
-            start_input = st.date_input(
-                "시작일 입력",
-                value=st.session_state.start_date,
-                min_value=min_date,
-                max_value=max_date
-            )
-        with col2:
-            end_input = st.date_input(
-                "종료일 입력",
-                value=st.session_state.end_date,
-                min_value=min_date,
-                max_value=max_date
-            )
+    col1, col2 = st.columns([5, 1])
+    with col1:
+        # 입력창에 session_state.ticker 자동 연계
+        ticker_input = st.text_input("티커 입력", value=st.session_state.ticker).strip().upper()
+    with col2:
+        st.markdown("<div style='padding-top: 28px;'></div>", unsafe_allow_html=True)
+        query_btn = st.button("조회", use_container_width=True)
         
-        # 폼 제출 버튼
-        submitted = st.form_submit_button(label="기간 적용 및 조회", use_container_width=True)
+    if query_btn:
+        st.session_state.ticker = ticker_input
+        st.rerun()
 
-# 제출 버튼이 눌렸을 때만 값을 검증하고 반영
-if submitted:
-    if start_input > end_input:
-        st.error("시작일은 종료일보다 이전이어야 합니다.")
-    else:
-        st.session_state.start_date = start_input
-        st.session_state.end_date = end_input
+    ticker = st.session_state.ticker
 
-# 최종 차트에 적용할 필터링 날짜 설정
-start_date = st.session_state.start_date
-end_date = st.session_state.end_date
+    if not ticker:
+        st.info("차트를 조회하려면 티커를 입력해주세요. (예: QCOM, KO, PG)")
+        st.stop()
 
-# st.fragment 데코레이터 지원 확인 및 조건부 정의
-def conditional_fragment(func):
-    if hasattr(st, "fragment"):
-        return st.fragment()(func)
-    return func
+    @st.cache_data
+    def get_stock_data(ticker):
+        # 데이터 가져오기
+        df_price = yf.download(ticker, period="max", auto_adjust=False)
+        df_close = df_price['Close'].copy()
+        
+        # 단일 티커 검색 시 MultiIndex 컬럼일 경우 평탄화
+        if isinstance(df_price.columns, pd.MultiIndex):
+            df_price.columns = df_price.columns.droplevel(1)
 
-@conditional_fragment
-def render_chart_section(ticker, df_price, df_stat, df_div_period, df_com, start_date, end_date):
-    tab1, tab2 = st.tabs(["📊 분석 차트", "📜 배당 상세 내역"])
-    with tab1:
-            # 1. Quick Period Selector (Streamlit 가로형 라디오 버튼)
+        # 배당수익률 지표 계산 로직
+        df_div = dyf.get_yf_dividend_history(ticker)
+        df_div_period = dyf.add_period_columns_by_div(df_div)
+        df_com = dyf.group_by_period_by_div(df_div_period)
+        _, df_stat = dyf.merge_dividend_data(df_close, df_com)
+        
+        # 데이터의 날짜 범위 확인 (timezone 제거하여 일치시킴)
+        df_price.index = df_price.index.tz_localize(None)
+        df_stat['Date'] = pd.to_datetime(df_stat['Date']).dt.tz_localize(None)
+        
+        return df_price, df_stat, df_div_period, df_com
+
+    with st.spinner("데이터 로딩 및 차트 작성 중..."):
+        try:
+            df_price, df_stat, df_div_period, df_com = get_stock_data(ticker)
+        except Exception as e:
+            st.error(f"데이터 조회에 실패했습니다. 올바른 티커명이거나 배당 내역이 존재하는지 확인해 주세요. 에러: {e}")
+            st.stop()
+
+    min_date = df_price.index.min().to_pydatetime().date()
+    max_date = df_price.index.max().to_pydatetime().date()
+
+    # 기본 조회 범위를 2010년 1월 1일로 설정
+    default_start = max(min_date, pd.to_datetime("2010-01-01").date())
+
+    if "start_date" not in st.session_state:
+        st.session_state.start_date = default_start
+    if "end_date" not in st.session_state:
+        st.session_state.end_date = max_date
+
+    # 상세 기간 설정용 expander 추가 (모바일 화면 최적화)
+    with st.expander("📅 상세 기간 직접 설정 (날짜 지정)", expanded=False):
+        with st.form(key="date_range_form"):
+            col1, col2 = st.columns(2)
+            with col1:
+                start_input = st.date_input(
+                    "시작일 입력",
+                    value=st.session_state.start_date,
+                    min_value=min_date,
+                    max_value=max_date
+                )
+            with col2:
+                end_input = st.date_input(
+                    "종료일 입력",
+                    value=st.session_state.end_date,
+                    min_value=min_date,
+                    max_value=max_date
+                )
+            submitted = st.form_submit_button(label="기간 적용 및 조회", use_container_width=True)
+
+    if submitted:
+        if start_input > end_input:
+            st.error("시작일은 종료일보다 이전이어야 합니다.")
+        else:
+            st.session_state.start_date = start_input
+            st.session_state.end_date = end_input
+
+    start_date = st.session_state.start_date
+    end_date = st.session_state.end_date
+
+    def conditional_fragment(func):
+        if hasattr(st, "fragment"):
+            return st.fragment()(func)
+        return func
+
+    @conditional_fragment
+    def render_chart_section(ticker, df_price, df_stat, df_div_period, df_com, start_date, end_date):
+        tab1, tab2 = st.tabs(["📊 분석 차트", "📜 배당 상세 내역"])
+        with tab1:
             period_options = {
                 "전체": None,
                 "5년": pd.Timedelta(days=365 * 5),
@@ -133,7 +158,6 @@ def render_chart_section(ticker, df_price, df_stat, df_div_period, df_com, start
             else:
                 actual_start_date = pd.to_datetime(start_date)
 
-            # 선택한 기간으로 데이터 필터링
             df_filtered = df_price.loc[actual_start_date:actual_end_date]
             df_stat_filtered = df_stat[
                 (df_stat['Date'] >= actual_start_date) & 
@@ -144,18 +168,15 @@ def render_chart_section(ticker, df_price, df_stat, df_div_period, df_com, start
                 (df_com['start_date'] <= actual_end_date)
             ].copy()
 
-            # 우측 버퍼(5%)를 데이터 자체에 강제로 공백 행(NaN)으로 주입하여 여백 형성 (비율이 현재 표시된 기간 기준으로 유동적 계산됨)
             if not df_filtered.empty:
                 time_buffer = (actual_end_date - actual_start_date) * 0.05
                 buffer_date = actual_end_date + time_buffer
 
-                # 주가 데이터프레임 복사 후 마지막에 NaN값을 가지는 버퍼 날짜 행 추가
                 last_row = df_filtered.tail(1).copy()
                 last_row.index = [buffer_date]
                 last_row.iloc[0] = None
                 df_filtered_buffered = pd.concat([df_filtered, last_row]).sort_index()
 
-                # 배당 데이터프레임 복사 후 마지막에 Date만 채워진 행 추가
                 if not df_stat_filtered.empty:
                     last_row_stat = df_stat_filtered.tail(1).copy()
                     last_row_stat.index = [len(df_stat_filtered)]
@@ -172,7 +193,6 @@ def render_chart_section(ticker, df_price, df_stat, df_div_period, df_com, start
                 df_filtered_buffered = df_filtered
                 df_stat_filtered_buffered = df_stat_filtered
 
-            # 5. Plotly를 이용한 HTS식 레이어 차트 그리기 (5단 분할 차트)
             fig = make_subplots(
                 rows=5, cols=1,
                 shared_xaxes=True,
@@ -187,19 +207,16 @@ def render_chart_section(ticker, df_price, df_stat, df_div_period, df_com, start
                 row_heights=[0.2, 0.2, 0.2, 0.2, 0.2]
             )
 
-            # 기본 주가 캔들스틱 (또는 라인) 추가 (버퍼가 적용된 데이터 사용)
             fig.add_trace(
                 px.Scatter(x=df_filtered_buffered.index, y=df_filtered_buffered['Close'], name="주가 (종가)", line=dict(color='royalblue', width=1), hovertemplate="%{y}<extra></extra>"),
                 row=1, col=1
             )
 
-            # 내가 만든 고유 지표를 하단 차트에 따로 그리기 (빨간 점선, 버퍼가 적용된 데이터 사용)
             fig.add_trace(
                 px.Scatter(x=df_stat_filtered_buffered.Date, y=df_stat_filtered_buffered['dfs'], name="배당수익률(DFS)", line=dict(color='firebrick', width=1, dash='solid'), hovertemplate="%{y}<extra></extra>"),
                 row=2, col=1
             )
 
-            # 3단: 배당금 (Adjusted Dividend) - 단계형 선(step line)으로 구성
             fig.add_trace(
                 px.Scatter(
                     x=df_stat_filtered_buffered.Date, 
@@ -211,7 +228,6 @@ def render_chart_section(ticker, df_price, df_stat, df_div_period, df_com, start
                 row=3, col=1
             )
 
-            # 4단: 배당 성장률 (div_change) - 단계형 영역 차트(Step Area Chart)로 구성
             fig.add_trace(
                 px.Scatter(
                     x=df_stat_filtered_buffered.Date,
@@ -219,13 +235,12 @@ def render_chart_section(ticker, df_price, df_stat, df_div_period, df_com, start
                     name="배당 성장률 (%)",
                     line=dict(color='rgba(46, 204, 113, 1)', width=1.5, shape='hv'),
                     fill='tozeroy',
-                    fillcolor='rgba(46, 204, 113, 0.15)',  # 반투명 초록색으로 하단 영역 채움
+                    fillcolor='rgba(46, 204, 113, 0.15)',
                     hovertemplate="%{y}<extra></extra>"
                 ),
                 row=4, col=1
             )
 
-            # 5단: 주가 비교 (Close vs Adj Close)
             fig.add_trace(
                 px.Scatter(
                     x=df_filtered_buffered.index, 
@@ -247,7 +262,6 @@ def render_chart_section(ticker, df_price, df_stat, df_div_period, df_com, start
                 row=5, col=1
             )
 
-            # 0% 기준선(점선) 추가
             fig.add_hline(
                 y=0,
                 line_dash="dash",
@@ -257,7 +271,6 @@ def render_chart_section(ticker, df_price, df_stat, df_div_period, df_com, start
                 col=1
             )
 
-            # 6. 배당 지급일 및 배당 주기 변경일에 보조선(수직선) 추가
             if not df_div_period.empty and 'Date' in df_div_period.columns and 'period' in df_div_period.columns:
                 import plotly.io as pio
                 try:
@@ -274,11 +287,8 @@ def render_chart_section(ticker, df_price, df_stat, df_div_period, df_com, start
 
                 df_div_period_temp = df_div_period.copy()
                 df_div_period_temp['Date'] = pd.to_datetime(df_div_period_temp['Date']).dt.tz_localize(None)
-
-                # period 값의 변화 감지 (이전 행과 값이 다르면 변경된 것으로 판단, 최초 행도 변경된 것으로 봄)
                 df_div_period_temp['period_changed'] = df_div_period_temp['period'] != df_div_period_temp['period'].shift()
 
-                # 현재 조회 기간 내의 데이터만 필터링
                 df_div_period_filtered = df_div_period_temp[
                     (df_div_period_temp['Date'] >= pd.to_datetime(actual_start_date)) & 
                     (df_div_period_temp['Date'] <= pd.to_datetime(actual_end_date))
@@ -287,9 +297,7 @@ def render_chart_section(ticker, df_price, df_stat, df_div_period, df_com, start
                 tick_vals = []
                 for _, row in df_div_period_filtered.iterrows():
                     date_val = row['Date']
-                    # Plotly가 날짜 축에서 올바르게 인식하도록 파이썬 내장 datetime 객체로 변환
                     date_val_dt = pd.to_datetime(date_val).to_pydatetime()
-
                     is_period_changed = row['period_changed']
                     line_style = dict(
                         width=1.5 if is_period_changed else 1,
@@ -297,68 +305,21 @@ def render_chart_section(ticker, df_price, df_stat, df_div_period, df_com, start
                         color="rgba(128, 128, 128, 0.4)"
                     )
 
-                    # Row 1 세로선
-                    fig.add_shape(
-                        type="line",
-                        x0=date_val_dt, x1=date_val_dt,
-                        y0=0, y1=1,
-                        xref="x",
-                        yref="y domain",
-                        line=line_style,
-                        layer="below"
-                    )
-
-                    # Row 2 세로선
-                    fig.add_shape(
-                        type="line",
-                        x0=date_val_dt, x1=date_val_dt,
-                        y0=0, y1=1,
-                        xref="x2",
-                        yref="y2 domain",
-                        line=line_style,
-                        layer="below"
-                    )
-
-                    # Row 3 세로선
-                    fig.add_shape(
-                        type="line",
-                        x0=date_val_dt, x1=date_val_dt,
-                        y0=0, y1=1,
-                        xref="x3",
-                        yref="y3 domain",
-                        line=line_style,
-                        layer="below"
-                    )
-
-                    # Row 4 세로선
-                    fig.add_shape(
-                        type="line",
-                        x0=date_val_dt, x1=date_val_dt,
-                        y0=0, y1=1,
-                        xref="x4",
-                        yref="y4 domain",
-                        line=line_style,
-                        layer="below"
-                    )
-
-                    # Row 5 세로선
-                    fig.add_shape(
-                        type="line",
-                        x0=date_val_dt, x1=date_val_dt,
-                        y0=0, y1=1,
-                        xref="x5",
-                        yref="y5 domain",
-                        line=line_style,
-                        layer="below"
-                    )
+                    for r in range(1, 6):
+                        fig.add_shape(
+                            type="line",
+                            x0=date_val_dt, x1=date_val_dt,
+                            y0=0, y1=1,
+                            xref=f"x{r}" if r > 1 else "x",
+                            yref=f"y{r} domain" if r > 1 else "y domain",
+                            line=line_style,
+                            layer="below"
+                        )
 
                     if is_period_changed:
-                        # x축 눈금 표시를 위해 저장
                         tick_vals.append(date_val_dt)
 
-                # period 변경 지점들에 x축 눈금(ticks) 설정 (모든 서브플롯에 표시하되, 가독성을 위해 -45도 회전)
                 if tick_vals:
-                    # Plotly가 날짜 축에서 올바르게 직렬화하여 인식할 수 있도록 pandas Timestamp를 파이썬 내장 datetime 객체로 변환합니다.
                     tick_vals_dt = [pd.to_datetime(d).to_pydatetime() for d in tick_vals]
                     tick_text = [pd.to_datetime(d).strftime('%Y-%m') for d in tick_vals]
                     fig.update_xaxes(
@@ -371,34 +332,31 @@ def render_chart_section(ticker, df_price, df_stat, df_div_period, df_com, start
                 else:
                     fig.update_xaxes(showticklabels=True, tickangle=-45)
 
-            # 차트 레이아웃 조정 (HTS 느낌 내기)
             fig.update_layout(
                 title=dict(
                     text=f"{ticker} 주가 및 배당 분석",
                     x=0.5,
                     xanchor="center",
-                    y=0.965, # 높이가 2000px로 줄었으므로 상단 마진 내에서 타이틀 위치 재조정
+                    y=0.965,
                     yanchor="top"
                 ),
-                hovermode="x unified", # 마우스를 올리면 같은 날짜의 모든 지표를 한눈에 보여줌 (HTS 핵심 기능)
-                template="plotly_dark", # 어두운 HTS 테마 느낌
-                height=2000, # 모바일 스크롤 및 화면 비율을 고려해 2000으로 조정 (각 subplot 400px 수준)
-                showlegend=False, # 전체 범례를 숨기고 개별 그래프 내부에 표시
-                margin=dict(l=50, r=20, t=120, b=50), # 상단 여백을 120으로 조정하여 공간 확보
+                hovermode="x unified",
+                template="plotly_dark",
+                height=2000,
+                showlegend=False,
+                margin=dict(l=50, r=20, t=120, b=50),
                 hoverlabel=dict(
-                    bgcolor="rgba(33, 37, 41, 0.3)",     # 투명도를 높인(30%) 어두운 배경
-                    font_color="white",                  # 글자 색상
-                    font_size=11,                        # 글자 크기
-                    bordercolor="rgba(255, 255, 255, 0.1)" # 더욱 은은한 테두리
+                    bgcolor="rgba(33, 37, 41, 0.3)",
+                    font_color="white",
+                    font_size=11,
+                    bordercolor="rgba(255, 255, 255, 0.1)"
                 )
             )
 
-            # 서브플롯 제목들의 폰트 크기 및 위치 조정 (위쪽 겹침을 방지하기 위해 조금만 위로 띄움)
             for annotation in fig.layout.annotations:
                 annotation.font.size = 12
                 annotation.y = annotation.y + 0.007
 
-            # 7. 복수 지표가 들어가는 최하단 서브플롯(Row 5)에만 개별 범례(Legend) 표시 (단일 지표인 Row 1~4는 제목과 중복되므로 제거하여 모바일 공간 확보)
             fig.add_annotation(
                 text="<span style='color:royalblue'>■</span> Close &nbsp;&nbsp;&nbsp;&nbsp; <span style='color:limegreen'>■</span> Adj Close",
                 xref="x5 domain", yref="y5 domain",
@@ -413,7 +371,6 @@ def render_chart_section(ticker, df_price, df_stat, df_div_period, df_com, start
                 row=5, col=1
             )
 
-            # 각 서브플롯의 y축 스타일 및 줌 고정 설정 (서브플롯 제목과 중복되는 y축 제목은 제거하여 가로 공간 확보)
             fig.update_yaxes(
                 fixedrange=True,
                 showline=True,
@@ -422,21 +379,19 @@ def render_chart_section(ticker, df_price, df_stat, df_div_period, df_com, start
                 mirror=False
             )
 
-            # x축 선 및 스타일 설정 (날짜임이 명확하므로 '날짜' 제목 제거하여 세로 공간 절약)
             fig.update_xaxes(
-                type="date",            # x축을 날짜 축으로 강제
+                type="date",
                 showline=True, 
                 linewidth=1, 
                 linecolor='rgba(255, 255, 255, 0.8)', 
                 mirror=False,
-                ticks="outside",        # 눈금 표시선(Tick mark)을 축 바깥쪽으로 표시
-                ticklen=5,              # 눈금 표시선 길이
-                tickwidth=1,            # 눈금 표시선 두께를 1로 글로벌 통일
-                tickcolor="grey",       # 눈금 표시선 색상
-                rangeslider=dict(visible=False) # 범위 선택기(Rangeslider) 공백 제거
+                ticks="outside",
+                ticklen=5,
+                tickwidth=1,
+                tickcolor="grey",
+                rangeslider=dict(visible=False)
             )
 
-            # 마우스 호버 시 수직/수평 십자 보조선(Spikeline) 활성화 (HTS 스타일)
             fig.update_xaxes(
                 showspikes=True,
                 spikethickness=1,
@@ -444,7 +399,7 @@ def render_chart_section(ticker, df_price, df_stat, df_div_period, df_com, start
                 spikecolor="grey",
                 spikemode="across",
                 spikesnap="data",
-                hoverformat="%Y-%m-%d"  # 날짜 표시 형식 설정 (예: 2025-03-15)
+                hoverformat="%Y-%m-%d"
             )
 
             fig.update_yaxes(
@@ -456,65 +411,353 @@ def render_chart_section(ticker, df_price, df_stat, df_div_period, df_com, start
                 spikesnap="data"
             )
 
-            # 5. 웹 화면에 차트 띄우기
             st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True, 'doubleClick': 'reset'})
 
-
-    with tab2:
-        st.markdown("### 📜 배당 변동 주기별 상세 내역")
-        st.markdown("각 배당금 지급 주기별 주요 통계 및 배당성장률 요약표입니다. (최신 주기 순 정렬)")
-        
-        if not df_com_filtered.empty:
-            # 1. 상단 통계 카드 메트릭 추가
-            latest_row = df_com_filtered.iloc[-1]
-            latest_div = latest_row['adj_div']
-            latest_growth = latest_row['div_change'] * 100 if pd.notnull(latest_row['div_change']) else 0
-            avg_growth = df_com_filtered['div_change'].mean() * 100 if df_com_filtered['div_change'].notnull().any() else 0
+        with tab2:
+            st.markdown("### 📜 배당 변동 주기별 상세 내역")
+            st.markdown("각 배당금 지급 주기별 주요 통계 및 배당성장률 요약표입니다. (최신 주기 순 정렬)")
             
-            m1, m2, m3 = st.columns(3)
-            m1.metric("현재 연간 배당금 (환산)", f"${latest_div:.4f}")
-            m2.metric("최근 배당 성장률", f"{latest_growth:+.2f}%" if pd.notnull(latest_row['div_change']) else "-")
-            m3.metric("평균 배당 성장률", f"{avg_growth:+.2f}%")
+            if not df_com_filtered.empty:
+                latest_row = df_com_filtered.iloc[-1]
+                latest_div = latest_row['adj_div']
+                latest_growth = latest_row['div_change'] * 100 if pd.notnull(latest_row['div_change']) else 0
+                avg_growth = df_com_filtered['div_change'].mean() * 100 if df_com_filtered['div_change'].notnull().any() else 0
+                
+                m1, m2, m3 = st.columns(3)
+                m1.metric("현재 연간 배당금 (환산)", f"${latest_div:.4f}")
+                m2.metric("최근 배당 성장률", f"{latest_growth:+.2f}%" if pd.notnull(latest_row['div_change']) else "-")
+                m3.metric("평균 배당 성장률", f"{avg_growth:+.2f}%")
+                
+                st.divider()
+                
+                df_display = df_com_filtered.copy()
+                df_display = df_display.sort_values('period', ascending=False)
+                
+                df_display = df_display.rename(columns={
+                    'period': '주기 ID',
+                    'start_date': '시작일',
+                    'end_date': '종료일',
+                    'count': '지급 횟수',
+                    'dividend_mean': '주당 배당금 (평균)',
+                    'adj_div': '연간 환산 배당금',
+                    'div_change': '배당 성장률'
+                })
+                
+                cols_to_show = ['시작일', '종료일', '주당 배당금 (평균)', '지급 횟수', '연간 환산 배당금', '배당 성장률']
+                df_display = df_display[cols_to_show]
+                df_display['배당 성장률'] = df_display['배당 성장률'] * 100
+                
+                st.dataframe(
+                    df_display,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "시작일": st.column_config.DateColumn("시작일", format="YYYY-MM-DD"),
+                        "종료일": st.column_config.DateColumn("종료일", format="YYYY-MM-DD"),
+                        "주당 배당금 (평균)": st.column_config.NumberColumn("주당 배당금 (평균)", format="$%.4f"),
+                        "지급 횟수": st.column_config.NumberColumn("지급 횟수", format="%d회"),
+                        "연간 환산 배당금": st.column_config.NumberColumn("연간 환산 배당금", format="$%.4f"),
+                        "배당 성장률": st.column_config.NumberColumn("배당 성장률", format="%.2f%%")
+                    }
+                )
+            else:
+                st.info("선택한 기간 동안의 배당 변동 데이터가 없습니다.")
+
+    render_chart_section(ticker, df_price, df_stat, df_div_period, df_com, start_date, end_date)
+
+    # --- 개인 기록 관리 섹션 추가 ---
+    st.divider()
+    st.subheader(f"📝 {ticker} 개인 기록 관리")
+
+    col_wl, col_pf = st.columns(2)
+
+    # 관심 종목 체크 및 설정
+    watchlist = sh.get_watchlist()
+    is_in_wl = ticker in watchlist
+
+    with col_wl:
+        st.markdown("##### ⭐ 관심 종목 설정")
+        if is_in_wl:
+            if st.button("⭐ 관심 종목에서 해제", use_container_width=True):
+                sh.remove_from_watchlist(ticker)
+                st.success("관심 종목에서 해제되었습니다.")
+                st.rerun()
+        else:
+            if st.button("⭐ 관심 종목으로 등록", use_container_width=True, type="primary"):
+                sh.add_to_watchlist(ticker)
+                st.success("관심 종목으로 등록되었습니다.")
+                st.rerun()
+
+    # 포트폴리오 정보 불러오기
+    portfolio_df = sh.get_portfolio()
+    in_portfolio = ticker in portfolio_df['symbol'].values
+    p_shares = 0.0
+    p_price = 0.0
+    if in_portfolio:
+        row = portfolio_df[portfolio_df['symbol'] == ticker].iloc[0]
+        p_shares = float(row['shares'])
+        p_price = float(row['purchase_price'])
+
+    with col_pf:
+        st.markdown("##### 💼 포트폴리오 관리")
+        status_txt = f"현재 보유 중: {p_shares}주 (평단 ${p_price:.2f})" if in_portfolio else "현재 미보유"
+        st.caption(status_txt)
+        
+        with st.popover("💼 보유 자산 정보 수정", use_container_width=True):
+            with st.form("pf_edit_form", clear_on_submit=False):
+                shares_in = st.number_input("보유 수량 (주)", min_value=0.0, value=p_shares, step=0.1)
+                price_in = st.number_input("평균 매수 단가 ($)", min_value=0.0, value=p_price, step=0.01)
+                pf_submit = st.form_submit_button("저장하기", use_container_width=True)
+                if pf_submit:
+                    if shares_in > 0:
+                        sh.save_portfolio(ticker, shares_in, price_in)
+                        st.success("포트폴리오가 정상적으로 저장되었습니다.")
+                        st.rerun()
+                    else:
+                        if in_portfolio:
+                            sh.remove_from_portfolio(ticker)
+                            st.success("포트폴리오에서 삭제되었습니다.")
+                            st.rerun()
+
+    st.markdown("##### ✍️ 투자 메모 및 코멘트")
+    saved_comment = sh.get_comment(ticker)
+    comment_in = st.text_area("이 종목에 대한 분석이나 매수 근거 등의 기록을 남겨보세요.", value=saved_comment, height=120)
+    if st.button("📝 코멘트 저장", use_container_width=True):
+        sh.save_comment(ticker, comment_in)
+        st.success("코멘트가 성공적으로 저장되었습니다.")
+        st.rerun()
+
+# 2. 전체 종목 리스트 페이지
+elif st.session_state.menu == "📋 전체 종목 리스트":
+    st.header("📋 전체 배당 종목 리스트")
+    st.markdown("구글 스프레드시트에 연동된 나스닥 + S&P 500의 배당주 및 주요 배당 ETF 목록입니다.")
+    
+    with st.spinner("종목 리스트 불러오는 중..."):
+        stocks_df = sh.get_stocks()
+        
+    if stocks_df.empty:
+        st.warning("구글 시트에 저장된 종목 데이터가 없습니다. 아래 업데이트 버튼을 눌러 데이터를 수집해 주세요.")
+    else:
+        # 검색 및 필터 UI
+        col_search, col_filter = st.columns([3, 1])
+        with col_search:
+            search_query = st.text_input("종목 검색 (티커 또는 회사명)", "").strip().upper()
+        with col_filter:
+            asset_filter = st.selectbox("자산 분류 필터", ["전체", "주식", "ETF"])
+            
+        filtered_df = stocks_df.copy()
+        
+        # 필터 적용
+        if asset_filter == "주식":
+            filtered_df = filtered_df[filtered_df['stock_type'] == 'STOCK']
+        elif asset_filter == "ETF":
+            filtered_df = filtered_df[filtered_df['stock_type'] == 'ETF']
+            
+        if search_query:
+            filtered_df = filtered_df[
+                filtered_df['symbol'].str.contains(search_query, case=False) |
+                filtered_df['companyName'].str.contains(search_query, case=False)
+            ]
+            
+        st.markdown(f"**총 {len(filtered_df)}개의 배당 자산이 조회되었습니다.**")
+        
+        # 종목 빠른 분석 연계
+        selected_ticker = st.selectbox("📊 상세 차트 분석으로 이동할 종목 선택", ["선택 안 함"] + filtered_df['symbol'].tolist())
+        if selected_ticker != "선택 안 함":
+            st.session_state.ticker = selected_ticker
+            st.session_state.menu = "📊 개별 종목 분석"
+            st.rerun()
+            
+        # 테이블 표시
+        display_df = filtered_df.copy()
+        display_df = display_df.rename(columns={
+            'symbol': '티커',
+            'companyName': '회사명',
+            'lastDividend': '최근 주당 배당금 ($)',
+            'stock_type': '자산 유형',
+            'updated_at': '동기화 일자'
+        })
+        
+        st.dataframe(
+            display_df[['티커', '회사명', '최근 주당 배당금 ($)', '자산 유형', '동기화 일자']],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "최근 주당 배당금 ($)": st.column_config.NumberColumn("최근 주당 배당금 ($)", format="$%.4f")
+            }
+        )
+        
+    st.divider()
+    st.subheader("🔄 데이터 실시간 강제 동기화")
+    st.markdown("Wikipedia 및 yfinance를 참조하여 S&P 500, 나스닥 100 및 배당 ETF 데이터를 동기화합니다. (약 30~60초 소요)")
+    if st.button("🔄 종목 리스트 및 배당정보 수동 업데이트", use_container_width=True):
+        with st.spinner("웹 스크레이퍼 및 yfinance를 실행하여 구글 시트 데이터를 동기화하는 중..."):
+            try:
+                import fetch_dividend_stocks as fds
+                fds.run_update()
+                st.success("구글 시트와 동기화가 성공적으로 완료되었습니다!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"동기화 중 오류 발생: {e}")
+
+# 3. 내 자산 & 관심 종목 페이지
+elif st.session_state.menu == "💼 내 자산 & 관심 종목":
+    st.header("💼 내 자산 & 관심 종목")
+    
+    tab_pf, tab_wl = st.tabs(["💼 내 포트폴리오", "⭐ 관심 종목"])
+    
+    # 캐시된 종목 마스터 리스트 로딩
+    stocks_df = sh.get_stocks()
+    
+    with tab_pf:
+        st.subheader("보유 자산 현황 요약")
+        portfolio_df = sh.get_portfolio()
+        
+        if portfolio_df.empty:
+            st.info("포트폴리오가 현재 비어 있습니다. '📊 개별 종목 분석' 페이지에서 자산을 추가해 주세요.")
+        else:
+            pf_tickers = portfolio_df['symbol'].tolist()
+            close_prices = {}
+            
+            with st.spinner("보유 종목의 최신 주가 정보를 조회 중..."):
+                try:
+                    price_data = yf.download(pf_tickers, period="5d", interval="1d")
+                    if len(pf_tickers) == 1:
+                        close_prices[pf_tickers[0]] = float(price_data['Close'].iloc[-1])
+                    else:
+                        for t in pf_tickers:
+                            try:
+                                close_prices[t] = float(price_data['Close'][t].iloc[-1])
+                            except Exception:
+                                close_prices[t] = 0.0
+                except Exception as e:
+                    st.error(f"실시간 주가 로딩 실패 (이전 평단가로 대체): {e}")
+                    close_prices = {t: 0.0 for t in pf_tickers}
+            
+            total_invested = 0.0
+            total_current_val = 0.0
+            total_annual_div = 0.0
+            rows = []
+            
+            for _, row in portfolio_df.iterrows():
+                sym = row['symbol']
+                shares = float(row['shares'])
+                avg_cost = float(row['purchase_price'])
+                
+                curr_price = close_prices.get(sym, 0.0)
+                if curr_price == 0.0:
+                    curr_price = avg_cost
+                    
+                stock_info = stocks_df[stocks_df['symbol'] == sym]
+                name = stock_info.iloc[0]['companyName'] if not stock_info.empty else sym
+                
+                # FMP/yfinance의 single payout 배당금에 4(분기 배당 가정)를 곱해 연간 배당금으로 환산
+                last_div = float(stock_info.iloc[0]['lastDividend']) if not stock_info.empty else 0.0
+                annual_div_per_share = last_div * 4
+                
+                cost = shares * avg_cost
+                val = shares * curr_price
+                annual_div = shares * annual_div_per_share
+                
+                total_invested += cost
+                total_current_val += val
+                total_annual_div += annual_div
+                
+                gain_loss = val - cost
+                gain_loss_pct = (gain_loss / cost * 100) if cost > 0 else 0.0
+                
+                rows.append({
+                    '티커': sym,
+                    '종목명': name,
+                    '보유 수량': shares,
+                    '평균 매수가 ($)': avg_cost,
+                    '현재 주가 ($)': curr_price,
+                    '투자 원금 ($)': cost,
+                    '현재 평가액 ($)': val,
+                    '수익률 (%)': gain_loss_pct,
+                    '예상 연간 배당금 ($)': annual_div,
+                    '배당수익률(평단 기준)': (annual_div_per_share / avg_cost * 100) if avg_cost > 0 else 0.0
+                })
+                
+            # 포트폴리오 요약 메트릭 표시
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("총 투자원금", f"${total_invested:,.2f}")
+            
+            total_gain = total_current_val - total_invested
+            total_gain_pct = (total_gain / total_invested * 100) if total_invested > 0 else 0.0
+            m2.metric("총 평가금액", f"${total_current_val:,.2f}", f"{total_gain_pct:+.2f}%")
+            
+            m3.metric("예상 세전 연배당금", f"${total_annual_div:,.2f}")
+            
+            avg_yield = (total_annual_div / total_current_val * 100) if total_current_val > 0 else 0.0
+            m4.metric("평균 배당수익률 (현재가 기준)", f"{avg_yield:.2f}%")
             
             st.divider()
             
-            # 2. 데이터 가공
-            df_display = df_com_filtered.copy()
-            # 최신 period 순 정렬
-            df_display = df_display.sort_values('period', ascending=False)
-            
-            # 컬럼명 매핑 및 필터링
-            df_display = df_display.rename(columns={
-                'period': '주기 ID',
-                'start_date': '시작일',
-                'end_date': '종료일',
-                'count': '지급 횟수',
-                'dividend_mean': '주당 배당금 (평균)',
-                'adj_div': '연간 환산 배당금',
-                'div_change': '배당 성장률'
-            })
-            
-            cols_to_show = ['시작일', '종료일', '주당 배당금 (평균)', '지급 횟수', '연간 환산 배당금', '배당 성장률']
-            df_display = df_display[cols_to_show]
-            
-            # 배당 성장률 백분율 변환 (100 곱하기)
-            df_display['배당 성장률'] = df_display['배당 성장률'] * 100
-            
-            # 데이터프레임 렌더링
+            # 보유 종목 상세 내역 테이블
+            pf_display_df = pd.DataFrame(rows)
             st.dataframe(
-                df_display,
+                pf_display_df,
                 use_container_width=True,
                 hide_index=True,
                 column_config={
-                    "시작일": st.column_config.DateColumn("시작일", format="YYYY-MM-DD"),
-                    "종료일": st.column_config.DateColumn("종료일", format="YYYY-MM-DD"),
-                    "주당 배당금 (평균)": st.column_config.NumberColumn("주당 배당금 (평균)", format="$%.4f"),
-                    "지급 횟수": st.column_config.NumberColumn("지급 횟수", format="%d회"),
-                    "연간 환산 배당금": st.column_config.NumberColumn("연간 환산 배당금", format="$%.4f"),
-                    "배당 성장률": st.column_config.NumberColumn("배당 성장률", format="%.2f%%")
+                    "평균 매수가 ($)": st.column_config.NumberColumn("평균 매수가", format="$%.2f"),
+                    "현재 주가 ($)": st.column_config.NumberColumn("현재 주가", format="$%.2f"),
+                    "투자 원금 ($)": st.column_config.NumberColumn("투자 원금", format="$%.2f"),
+                    "현재 평가액 ($)": st.column_config.NumberColumn("현재 평가액", format="$%.2f"),
+                    "수익률 (%)": st.column_config.NumberColumn("수익률 (%)", format="%+.2f%%"),
+                    "예상 연간 배당금 ($)": st.column_config.NumberColumn("예상 연간 배당금", format="$%.2f"),
+                    "배당수익률(평단 기준)": st.column_config.NumberColumn("배당수익률(평단)", format="%.2f%%")
                 }
             )
-        else:
-            st.info("선택한 기간 동안의 배당 변동 데이터가 없습니다.")
+            
+            # 관리 및 연계
+            st.subheader("⚙️ 포트폴리오 자산 개별 제어")
+            col_sel, col_del = st.columns([3, 1])
+            with col_sel:
+                sel_ticker = st.selectbox("분석 차트로 이동할 자산 선택", ["선택 안 함"] + pf_tickers)
+                if sel_ticker != "선택 안 함":
+                    st.session_state.ticker = sel_ticker
+                    st.session_state.menu = "📊 개별 종목 분석"
+                    st.rerun()
+            with col_del:
+                del_ticker = st.selectbox("포트폴리오에서 삭제할 자산 선택", ["선택 안 함"] + pf_tickers)
+                if del_ticker != "선택 안 함":
+                    if st.button("🗑️ 선택 자산 삭제", use_container_width=True):
+                        sh.remove_from_portfolio(del_ticker)
+                        st.success(f"{del_ticker} 삭제 성공!")
+                        st.rerun()
 
-render_chart_section(ticker, df_price, df_stat, df_div_period, df_com, start_date, end_date)
+    with tab_wl:
+        st.subheader("⭐ 내 관심 종목 목록")
+        watchlist = sh.get_watchlist()
+        
+        if not watchlist:
+            st.info("관심 등록된 종목이 없습니다. '📊 개별 종목 분석' 페이지에서 추가해 주세요.")
+        else:
+            watchlist_df = stocks_df[stocks_df['symbol'].isin(watchlist)]
+            if watchlist_df.empty:
+                st.info("관심 등록한 종목이 있지만 마스터 종목 정보에 존재하지 않습니다.")
+            else:
+                wl_display = watchlist_df.copy().rename(columns={
+                    'symbol': '티커',
+                    'companyName': '회사명',
+                    'lastDividend': '최근 주당 배당금 ($)',
+                    'stock_type': '자산 분류',
+                    'updated_at': '마지막 동기화'
+                })
+                
+                st.dataframe(
+                    wl_display[['티커', '회사명', '최근 주당 배당금 ($)', '자산 분류', '마지막 동기화']],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "최근 주당 배당금 ($)": st.column_config.NumberColumn("최근 주당 배당금 ($)", format="$%.4f")
+                    }
+                )
+                
+                wl_sel = st.selectbox("📊 분석 차트로 이동할 관심 종목 선택", ["선택 안 함"] + wl_display['티커'].tolist())
+                if wl_sel != "선택 안 함":
+                    st.session_state.ticker = wl_sel
+                    st.session_state.menu = "📊 개별 종목 분석"
+                    st.rerun()

@@ -4,7 +4,9 @@ import pandas as pd
 import yfinance as yf
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
+import datetime
 from io import StringIO
+import sheets_helper
 
 # Try to load API key from environment variable or local .env file
 API_KEY = os.environ.get("FMP_API_KEY")
@@ -125,23 +127,77 @@ def fetch_local_fallback():
     
     return pd.DataFrame(results)
 
-def main():
-    # 1. Try FMP
-    df = fetch_from_fmp()
-    
-    # 2. If FMP fails, run local fallback
-    if df is None or df.empty:
+def fetch_dividend_etfs():
+    """배당 ETF인 SCHD, VIG, DGRO에 대한 배당 정보를 조회합니다."""
+    print("Fetching dividend ETF data (SCHD, VIG, DGRO)...")
+    etfs = ["SCHD", "VIG", "DGRO"]
+    results = []
+    for etf in etfs:
+        res = check_dividend_status(etf)
+        if res:
+            res['stock_type'] = 'ETF'
+            results.append(res)
+        else:
+            # Fallback if check_dividend_status fails
+            results.append({
+                'symbol': etf,
+                'companyName': f"{etf} Dividend ETF",
+                'lastDividend': 0.0,
+                'stock_type': 'ETF'
+            })
+    return pd.DataFrame(results)
+
+def run_update():
+    """배당주 및 ETF 정보를 업데이트하여 구글 시트와 로컬 CSV에 저장합니다."""
+    # 1. 일반 주식 데이터 조회 (FMP -> Fallback)
+    df_stocks = fetch_from_fmp()
+    if df_stocks is None or df_stocks.empty:
         print("FMP API query failed or was restricted. Using local index fallback...")
-        df = fetch_local_fallback()
+        df_stocks = fetch_local_fallback()
         
-    if df is not None and not df.empty:
-        # Save to csv
-        output_path = "c:/dev_project/fn-web/us_dividend_tickers.csv"
-        df.to_csv(output_path, index=False, encoding='utf-8-sig')
-        print(f"\nSuccess! Saved {len(df)} dividend stocks to '{output_path}'.")
-        print(df.head(10))
+    if df_stocks is not None and not df_stocks.empty:
+        df_stocks['stock_type'] = 'STOCK'
     else:
-        print("Failed to retrieve any dividend stocks.")
+        df_stocks = pd.DataFrame(columns=['symbol', 'companyName', 'lastDividend', 'stock_type'])
+
+    # 2. 배당 ETF 데이터 조회
+    df_etfs = fetch_dividend_etfs()
+    
+    # 3. 데이터 병합
+    df_combined = pd.concat([df_stocks, df_etfs], ignore_index=True)
+    
+    # 컬럼 순서 맞추기 및 누락 컬럼 처리
+    for col in ['symbol', 'companyName', 'lastDividend', 'stock_type']:
+        if col not in df_combined.columns:
+            df_combined[col] = ""
+            
+    # 업데이트 일시 추가
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    df_combined['updated_at'] = now_str
+    
+    # 중복 제거 (티커 기준)
+    df_combined = df_combined.drop_duplicates(subset=['symbol'], keep='first')
+    
+    # 4. 구글 시트에 업데이트
+    print("Syncing data to Google Sheets...")
+    try:
+        sheets_helper.save_stocks(df_combined)
+        print("Google Sheets sync successful!")
+    except Exception as e:
+        print(f"Failed to sync to Google Sheets: {e}")
+        
+    # 5. 로컬 CSV 파일로 백업 저장
+    try:
+        output_path = "c:/dev_project/fn-web/us_dividend_tickers.csv"
+        df_combined.to_csv(output_path, index=False, encoding='utf-8-sig')
+        print(f"Backup saved to '{output_path}'.")
+    except Exception as e:
+        print(f"Failed to save CSV backup: {e}")
+        
+    return df_combined
+
+def main():
+    run_update()
 
 if __name__ == "__main__":
     main()

@@ -2,3 +2,6 @@ streamlit
 yfinance
 plotly
 pandas
+gspread
+google-auth
+gspread-dataframe
