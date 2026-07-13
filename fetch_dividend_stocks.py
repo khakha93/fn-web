@@ -8,16 +8,16 @@ import datetime
 from io import StringIO
 import sheets_helper
 
-# Try to load API key from environment variable or local .env file
+import tomllib
+
+# Try to load API key from environment variable (e.g. Streamlit Cloud secrets) or local secrets.toml
 API_KEY = os.environ.get("FMP_API_KEY")
 if not API_KEY:
     try:
-        with open(".env", "r") as f:
-            for line in f:
-                if line.startswith("FMP_API_KEY="):
-                    API_KEY = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    break
-    except:
+        with open(".streamlit/secrets.toml", "rb") as f:
+            secrets = tomllib.load(f)
+            API_KEY = secrets.get("FMP_API_KEY")
+    except Exception:
         pass
 
 def fetch_from_fmp():
@@ -185,14 +185,6 @@ def run_update():
         print("Google Sheets sync successful!")
     except Exception as e:
         print(f"Failed to sync to Google Sheets: {e}")
-        
-    # 5. 로컬 CSV 파일로 백업 저장
-    try:
-        output_path = "c:/dev_project/fn-web/us_dividend_tickers.csv"
-        df_combined.to_csv(output_path, index=False, encoding='utf-8-sig')
-        print(f"Backup saved to '{output_path}'.")
-    except Exception as e:
-        print(f"Failed to save CSV backup: {e}")
         
     return df_combined
 
