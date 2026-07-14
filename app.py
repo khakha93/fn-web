@@ -1,4 +1,4 @@
-import div_yf as dyf
+﻿import div_yf as dyf
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -538,64 +538,100 @@ elif st.session_state.menu == "📋 전체 종목 리스트":
     if stocks_df.empty:
         st.warning("구글 시트에 저장된 종목 데이터가 없습니다. 아래 업데이트 버튼을 눌러 데이터를 수집해 주세요.")
     else:
+        if "group" not in stocks_df.columns:
+            stocks_df["group"] = ""
+        if "weight" not in stocks_df.columns:
+            stocks_df["weight"] = pd.NA
+
+        stocks_df["group"] = stocks_df["group"].fillna("").astype(str).str.strip()
+        stocks_df["weight"] = pd.to_numeric(stocks_df["weight"], errors="coerce")
+
         # 검색 및 필터 UI
-        col_search, col_filter = st.columns([3, 1])
+        col_search, col_asset, col_group = st.columns([3, 1, 1])
         with col_search:
             search_query = st.text_input("종목 검색 (티커 또는 회사명)", "").strip().upper()
-        with col_filter:
-            asset_filter = st.selectbox("자산 분류 필터", ["전체", "주식", "ETF"])
-            
+        with col_asset:
+            asset_filter = st.selectbox("자산 분류 필터", ["전체", "주식", "ETF 구성종목"])
+        with col_group:
+            preferred = ["S&P", "Nasdaq", "SCHD", "VIG", "DGRO"]
+            groups = [g for g in stocks_df["group"].dropna().unique().tolist() if str(g).strip()]
+            group_ordered = [g for g in preferred if g in groups] + sorted([g for g in groups if g not in preferred])
+            group_filter = st.selectbox("그룹 필터", ["전체"] + group_ordered)
+
         filtered_df = stocks_df.copy()
-        
+        etf_groups = ["SCHD", "VIG", "DGRO"]
+
         # 필터 적용
-        if asset_filter == "주식":
-            filtered_df = filtered_df[filtered_df['stock_type'] == 'STOCK']
-        elif asset_filter == "ETF":
-            filtered_df = filtered_df[filtered_df['stock_type'] == 'ETF']
-            
+        if asset_filter == "ETF 구성종목":
+            filtered_df = filtered_df[filtered_df["group"].isin(etf_groups)]
+        elif asset_filter == "주식":
+            filtered_df = filtered_df[~filtered_df["group"].isin(etf_groups)]
+
+        if group_filter != "전체":
+            filtered_df = filtered_df[filtered_df["group"] == group_filter]
+
         if search_query:
             filtered_df = filtered_df[
-                filtered_df['symbol'].str.contains(search_query, case=False) |
-                filtered_df['companyName'].str.contains(search_query, case=False)
+                filtered_df["symbol"].astype(str).str.contains(search_query, case=False, na=False)
+                | filtered_df["companyName"].astype(str).str.contains(search_query, case=False, na=False)
             ]
-            
+
         st.markdown(f"**총 {len(filtered_df)}개의 배당 자산이 조회되었습니다.**")
-        
+
         # 종목 빠른 분석 연계
-        selected_ticker = st.selectbox("📊 상세 차트 분석으로 이동할 종목 선택", ["선택 안 함"] + filtered_df['symbol'].tolist())
+        selected_ticker = st.selectbox("📊 상세 차트 분석으로 이동할 종목 선택", ["선택 안 함"] + filtered_df["symbol"].tolist())
         if selected_ticker != "선택 안 함":
             st.session_state.ticker = selected_ticker
             st.session_state.menu = "📊 개별 종목 분석"
             st.rerun()
-            
+
         # 테이블 표시
         display_df = filtered_df.copy()
         display_df = display_df.rename(columns={
-            'symbol': '티커',
-            'companyName': '회사명',
-            'lastDividend': '최근 주당 배당금 ($)',
-            'stock_type': '자산 유형',
-            'updated_at': '동기화 일자'
+            "symbol": "티커",
+            "companyName": "회사명",
+            "lastDividend": "최근 주당 배당금 ($)",
+            "stock_type": "자산 유형",
+            "group": "그룹",
+            "weight": "비중(%)",
+            "updated_at": "동기화 일자",
         })
-        
+
+        columns_to_show = ["티커", "회사명", "최근 주당 배당금 ($)", "자산 유형", "그룹", "동기화 일자"]
+        if group_filter in etf_groups or asset_filter == "ETF 구성종목":
+            columns_to_show.insert(5, "비중(%)")
+
         st.dataframe(
-            display_df[['티커', '회사명', '최근 주당 배당금 ($)', '자산 유형', '동기화 일자']],
+            display_df[columns_to_show],
             use_container_width=True,
             hide_index=True,
             column_config={
-                "최근 주당 배당금 ($)": st.column_config.NumberColumn("최근 주당 배당금 ($)", format="$%.4f")
-            }
+                "최근 주당 배당금 ($)": st.column_config.NumberColumn("최근 주당 배당금 ($)", format="$%.4f"),
+                "비중(%)": st.column_config.NumberColumn("비중(%)", format="%.4f"),
+            },
         )
-        
+
     st.divider()
     st.subheader("🔄 데이터 실시간 강제 동기화")
-    st.markdown("Wikipedia 및 yfinance를 참조하여 S&P 500, 나스닥 100 및 배당 ETF 데이터를 동기화합니다. (약 30~60초 소요)")
+    st.markdown("Wikipedia와 무료 소스를 참조하여 S&P 500, 나스닥 100, SCHD/VIG/DGRO 구성종목 데이터를 동기화합니다. (약 30~120초 소요)")
     if st.button("🔄 종목 리스트 및 배당정보 수동 업데이트", use_container_width=True):
         with st.spinner("웹 스크레이퍼 및 yfinance를 실행하여 구글 시트 데이터를 동기화하는 중..."):
             try:
                 import fetch_dividend_stocks as fds
                 fds.run_update()
-                st.success("구글 시트와 동기화가 성공적으로 완료되었습니다!")
+
+                success_groups = getattr(fds, "LAST_SUCCESS_GROUPS", [])
+                failed_groups = getattr(fds, "LAST_FAILED_GROUPS", [])
+
+                if success_groups:
+                    st.info(f"성공 그룹: {', '.join(success_groups)}")
+                if failed_groups:
+                    st.warning(f"실패 그룹(부분 실패): {', '.join(failed_groups)}")
+
+                if failed_groups:
+                    st.success("구글 시트와 부분 동기화가 완료되었습니다.")
+                else:
+                    st.success("구글 시트와 동기화가 성공적으로 완료되었습니다!")
                 st.rerun()
             except Exception as e:
                 st.error(f"동기화 중 오류 발생: {e}")
@@ -761,3 +797,4 @@ elif st.session_state.menu == "💼 내 자산 & 관심 종목":
                     st.session_state.ticker = wl_sel
                     st.session_state.menu = "📊 개별 종목 분석"
                     st.rerun()
+
