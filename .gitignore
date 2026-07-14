@@ -3,6 +3,8 @@ test.*
 
 # data
 *.csv
+scratch/
+
 # 개발 계획 메모
 docs/
 .github/prompts/

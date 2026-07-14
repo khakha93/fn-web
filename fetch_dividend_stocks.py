@@ -1,7 +1,8 @@
-﻿import requests
+import requests
 import pandas as pd
 import yfinance as yf
 import os
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import datetime
@@ -210,7 +211,7 @@ def build_index_group_rows(tickers, group_name, max_workers=15):
     return _normalize_holdings_df(pd.DataFrame(rows))
 
 
-def normalize_weight(value):
+def normalize_weight(value, is_ratio=None):
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return pd.NA
 
@@ -226,8 +227,16 @@ def normalize_weight(value):
     except Exception:
         return pd.NA
 
-    if not is_percent and 0 < num <= 1:
+    if is_percent:
+        return round(num, 6)
+
+    if is_ratio is True:
         num = num * 100
+    elif is_ratio is False:
+        pass
+    else:
+        if 0 < num <= 1:
+            num = num * 100
 
     return round(num, 6)
 
@@ -324,7 +333,7 @@ def _parse_schd_table_rows(table_el):
 
         weight = pd.NA
         if i_weight is not None and i_weight < len(cells):
-            weight = normalize_weight(cells[i_weight])
+            weight = normalize_weight(cells[i_weight], is_ratio=False)
 
         rows.append(
             {
@@ -394,6 +403,110 @@ def _fetch_schd_allholdings_official():
     return out
 
 
+def _extract_initial_fund_data(html_text):
+    m = re.search(r"window\.__INITIAL_FUND_DATA__\s*=\s*(\{.*?\});", html_text, flags=re.S)
+    if not m:
+        return {}
+
+    try:
+        return json.loads(m.group(1))
+    except Exception:
+        return {}
+
+
+def _parse_vanguard_holdings_payload(payload, group_name):
+    if not isinstance(payload, dict) or not payload:
+        return _empty_holdings_df(), ""
+
+    latest_effective_date = str(payload.get("latestEffectiveDate") or "").strip()
+
+    date_key = ""
+    if latest_effective_date and latest_effective_date in payload:
+        date_key = latest_effective_date
+    else:
+        for k in payload.keys():
+            if k != "latestEffectiveDate":
+                date_key = k
+                break
+
+    if not date_key:
+        return _empty_holdings_df(), latest_effective_date
+
+    equity_rows = payload.get(date_key, {}).get("equity", [])
+    if not equity_rows:
+        return _empty_holdings_df(), latest_effective_date or date_key
+
+    rows = []
+    for row in equity_rows:
+        symbol = _extract_symbol(row.get("ticker", ""))
+        if not _is_valid_symbol(symbol):
+            continue
+
+        company_name = str(row.get("holdingName") or symbol).strip()
+        weight = normalize_weight(row.get("percentOfFunds"), is_ratio=False)
+
+        rows.append(
+            {
+                "symbol": symbol,
+                "companyName": company_name,
+                "lastDividend": pd.NA,
+                "stock_type": "STOCK",
+                "group": group_name,
+                "weight": weight,
+            }
+        )
+
+    if not rows:
+        return _empty_holdings_df(), latest_effective_date or date_key
+
+    out = _normalize_holdings_df(pd.DataFrame(rows))
+    out = out.drop_duplicates(subset=["group", "symbol"], keep="first")
+    return out, (latest_effective_date or date_key)
+
+
+def _fetch_vig_official_holdings():
+    product_url = "https://advisors.vanguard.com/investments/products/vig/vanguard-dividend-appreciation-etf"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": product_url,
+    }
+
+    # Stable default for VIG; if it fails, we still try parsing current product page bootstrap data.
+    port_id = "0920"
+
+    try:
+        page_resp = requests.get(product_url, headers=headers, timeout=25)
+        page_resp.raise_for_status()
+        initial_data = _extract_initial_fund_data(page_resp.text)
+        parsed_port_id = str(initial_data.get("portId") or "").strip()
+        if parsed_port_id:
+            port_id = parsed_port_id
+    except Exception as e:
+        print(f"VIG: product page bootstrap parse failed, using default port id {port_id}. ({e})")
+
+    api_url = f"https://advisors.vanguard.com/investments/products/api/funds/{port_id}/holdings/latest"
+    try:
+        resp = requests.get(api_url, headers=headers, timeout=25)
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception as e:
+        print(f"VIG official API fetch failed: {e}")
+        return _empty_holdings_df()
+
+    out, asof = _parse_vanguard_holdings_payload(payload, "VIG")
+    if out.empty:
+        print("VIG official API parse failed: no valid equity rows.")
+        return _empty_holdings_df()
+
+    print(f"VIG official API as-of: {asof} rows={len(out)} weight_notna={int(out['weight'].notna().sum())}")
+    if not _is_quality_holdings(out):
+        print("VIG official API failed quality gate.")
+        return _empty_holdings_df()
+
+    return out
+
+
 def _rows_from_holdings_table(df, group_name):
     if df is None or df.empty:
         return []
@@ -420,7 +533,7 @@ def _rows_from_holdings_table(df, group_name):
         if not company_name:
             company_name = symbol
 
-        weight = normalize_weight(row[weight_col]) if weight_col else pd.NA
+        weight = normalize_weight(row[weight_col], is_ratio=False) if weight_col else pd.NA
 
         rows.append(
             {
@@ -481,6 +594,10 @@ def _fetch_official_holdings(etf):
         schd_df = _fetch_schd_allholdings_official()
         if not schd_df.empty:
             return schd_df
+    if etf == "VIG":
+        vig_df = _fetch_vig_official_holdings()
+        if not vig_df.empty:
+            return vig_df
 
     official_sources = {
         "SCHD": [
@@ -581,7 +698,7 @@ def _fetch_holdings_from_yfinance(etf):
             if not symbol:
                 continue
             name = str(row[name_col]).strip() if name_col else symbol
-            weight = normalize_weight(row[weight_col]) if weight_col else pd.NA
+            weight = normalize_weight(row[weight_col], is_ratio=True) if weight_col else pd.NA
             rows.append(
                 {
                     "symbol": symbol,
@@ -675,7 +792,8 @@ def run_update():
 
     df_combined = _normalize_holdings_df(pd.concat(non_empty, ignore_index=True))
 
-    df_combined["weight"] = df_combined["weight"].apply(normalize_weight)
+    if not df_combined.empty:
+        df_combined["weight"] = pd.to_numeric(df_combined["weight"], errors="coerce")
 
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     df_combined["updated_at"] = now_str
