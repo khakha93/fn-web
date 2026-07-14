@@ -589,6 +589,64 @@ def _parse_csv_text(csv_text):
     return pd.DataFrame()
 
 
+def _fetch_dgro_official_holdings_varnish():
+    api_url = (
+        "https://www.blackrock.com/varnish-api/blk-one01-product-data/product-data/api/v1/get-fund-document"
+        "?appType=PRODUCT_PAGE"
+        "&appSubType=ISHARES"
+        "&targetSite=us-ishares"
+        "&locale=en_US"
+        "&portfolioId=264623"
+        "&userType=individual"
+        "&component=holdings"
+    )
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": "https://www.ishares.com/",
+    }
+
+    try:
+        resp = requests.get(api_url, headers=headers, timeout=25)
+        resp.raise_for_status()
+        raw_text = resp.text
+    except Exception as e:
+        print(f"DGRO API fetch failed: {e}")
+        return _empty_holdings_df()
+
+    raw_lines = raw_text.splitlines()
+    start_idx = -1
+    table_lines = []
+
+    for idx, line in enumerate(raw_lines):
+        if "Ticker,Name,Sector" in line:
+            start_idx = idx
+
+        if start_idx != -1 and idx >= start_idx:
+            if not line.strip():
+                break
+            table_lines.append(line)
+
+    if not table_lines:
+        print("DGRO Varnish parse failed: 'Ticker,Name,Sector' header not found.")
+        return _empty_holdings_df()
+
+    try:
+        df = pd.read_csv(StringIO("\n".join(table_lines)))
+    except Exception as e:
+        print(f"DGRO CSV read failed: {e}")
+        return _empty_holdings_df()
+
+    rows = _rows_from_holdings_table(df, "DGRO")
+    if not rows:
+        return _empty_holdings_df()
+
+    out = _normalize_holdings_df(pd.DataFrame(rows))
+    out = out.drop_duplicates(subset=["group", "symbol"], keep="first")
+    return out
+
+
 def _fetch_official_holdings(etf):
     if etf == "SCHD":
         schd_df = _fetch_schd_allholdings_official()
@@ -598,6 +656,10 @@ def _fetch_official_holdings(etf):
         vig_df = _fetch_vig_official_holdings()
         if not vig_df.empty:
             return vig_df
+    if etf == "DGRO":
+        dgro_df = _fetch_dgro_official_holdings_varnish()
+        if not dgro_df.empty:
+            return dgro_df
 
     official_sources = {
         "SCHD": [
