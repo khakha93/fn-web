@@ -1,6 +1,19 @@
 # test file
 test.*
 
+# data
+*.csv
+scratch/
+
+# 개발 계획 메모
+docs/
+.github/prompts/
+
+# Credentials
+google_key.json
+.streamlit/
+
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
