@@ -82,7 +82,8 @@ if st.session_state.menu == "📊 개별 종목 분석":
     @st.cache_data
     def get_stock_data(ticker):
         # 데이터 가져오기
-        df_price = yf.download(ticker, period="max", auto_adjust=False)
+        session = dyf.get_yf_session()
+        df_price = yf.download(ticker, period="max", auto_adjust=False, session=session)
         df_close = df_price['Close'].copy()
         
         # 단일 티커 검색 시 MultiIndex 컬럼일 경우 평탄화
@@ -90,7 +91,7 @@ if st.session_state.menu == "📊 개별 종목 분석":
             df_price.columns = df_price.columns.droplevel(1)
 
         # 배당수익률 지표 계산 로직
-        df_div = dyf.get_yf_dividend_history(ticker)
+        df_div = dyf.get_yf_dividend_history(ticker, session=session)
         df_div_period = dyf.add_period_columns_by_div(df_div)
         df_com = dyf.group_by_period_by_div(df_div_period)
         _, df_stat = dyf.merge_dividend_data(df_close, df_com)
