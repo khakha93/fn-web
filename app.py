@@ -1,4 +1,4 @@
-﻿import div_yf as dyf
+import div_yf as dyf
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -10,8 +10,29 @@ import sheets_helper as sh
 # Streamlit/yfinance 내부 expire_cache 관련 비동기 RuntimeWarning 무시
 warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*expire_cache.*")
 
-# 앱 기동 시 구글 시트 테이블 초기화
-sh.init_sheets()
+# 앱 기동 시 구글 시트 테이블 초기화 (캐시 처리)
+@st.cache_resource
+def run_init_sheets():
+    sh.init_sheets()
+
+run_init_sheets()
+
+# 구글 시트 읽기 기능 캐싱
+@st.cache_data(ttl=300)
+def get_stocks_cached():
+    return sh.get_stocks()
+
+@st.cache_data(ttl=60)
+def get_portfolio_cached():
+    return sh.get_portfolio()
+
+@st.cache_data(ttl=60)
+def get_watchlist_cached():
+    return sh.get_watchlist()
+
+@st.cache_data(ttl=60)
+def get_comment_cached(ticker):
+    return sh.get_comment(ticker)
 
 # Session State를 이용한 메뉴 및 기본 티커 상태 초기화
 if "menu" not in st.session_state:
@@ -472,7 +493,7 @@ if st.session_state.menu == "📊 개별 종목 분석":
     col_wl, col_pf = st.columns(2)
 
     # 관심 종목 체크 및 설정
-    watchlist = sh.get_watchlist()
+    watchlist = get_watchlist_cached()
     is_in_wl = ticker in watchlist
 
     with col_wl:
@@ -480,16 +501,18 @@ if st.session_state.menu == "📊 개별 종목 분석":
         if is_in_wl:
             if st.button("⭐ 관심 종목에서 해제", use_container_width=True):
                 sh.remove_from_watchlist(ticker)
+                st.cache_data.clear()
                 st.success("관심 종목에서 해제되었습니다.")
                 st.rerun()
         else:
             if st.button("⭐ 관심 종목으로 등록", use_container_width=True, type="primary"):
                 sh.add_to_watchlist(ticker)
+                st.cache_data.clear()
                 st.success("관심 종목으로 등록되었습니다.")
                 st.rerun()
 
     # 포트폴리오 정보 불러오기
-    portfolio_df = sh.get_portfolio()
+    portfolio_df = get_portfolio_cached()
     in_portfolio = ticker in portfolio_df['symbol'].values
     p_shares = 0.0
     p_price = 0.0
@@ -511,30 +534,48 @@ if st.session_state.menu == "📊 개별 종목 분석":
                 if pf_submit:
                     if shares_in > 0:
                         sh.save_portfolio(ticker, shares_in, price_in)
+                        st.cache_data.clear()
                         st.success("포트폴리오가 정상적으로 저장되었습니다.")
                         st.rerun()
                     else:
                         if in_portfolio:
                             sh.remove_from_portfolio(ticker)
+                            st.cache_data.clear()
                             st.success("포트폴리오에서 삭제되었습니다.")
                             st.rerun()
 
     st.markdown("##### ✍️ 투자 메모 및 코멘트")
-    saved_comment = sh.get_comment(ticker)
+    saved_comment = get_comment_cached(ticker)
     comment_in = st.text_area("이 종목에 대한 분석이나 매수 근거 등의 기록을 남겨보세요.", value=saved_comment, height=120)
     if st.button("📝 코멘트 저장", use_container_width=True):
         sh.save_comment(ticker, comment_in)
+        st.cache_data.clear()
         st.success("코멘트가 성공적으로 저장되었습니다.")
         st.rerun()
 
 # 2. 전체 종목 리스트 페이지
 elif st.session_state.menu == "📋 전체 종목 리스트":
-    st.header("📋 전체 배당 종목 리스트")
-    st.markdown("구글 스프레드시트에 연동된 나스닥 + S&P 500의 배당주 및 주요 배당 ETF 목록입니다.")
-    
     with st.spinner("종목 리스트 불러오는 중..."):
-        stocks_df = sh.get_stocks()
-        
+        stocks_df = get_stocks_cached().copy()
+
+    st.header("📋 전체 배당 종목 리스트")
+    st.markdown("<style>input { text-transform: uppercase; }</style>", unsafe_allow_html=True)
+    
+    # 각 그룹별 동기화 시각 추출 (하단 동기화 패널용)
+    group_times = {g: "-" for g in ["S&P", "Nasdaq", "SCHD", "VIG", "DGRO"]}
+    
+    if not stocks_df.empty:
+        # 임시로 그룹 데이터 전처리를 수행하여 정확한 매칭을 보장
+        if "group" in stocks_df.columns and "updated_at" in stocks_df.columns:
+            temp_groups = stocks_df["group"].fillna("").astype(str).str.strip()
+            for g in group_times.keys():
+                g_df_times = stocks_df[temp_groups == g]["updated_at"]
+                if not g_df_times.empty:
+                    raw_time = g_df_times.max()
+                    group_times[g] = str(raw_time) if pd.notna(raw_time) else "-"
+    
+    st.markdown("구글 시트와 연동된 주요 배당주 목록입니다.")
+    
     if stocks_df.empty:
         st.warning("구글 시트에 저장된 종목 데이터가 없습니다. 아래 업데이트 버튼을 눌러 데이터를 수집해 주세요.")
     else:
@@ -542,31 +583,50 @@ elif st.session_state.menu == "📋 전체 종목 리스트":
             stocks_df["group"] = ""
         if "weight" not in stocks_df.columns:
             stocks_df["weight"] = pd.NA
+        if "marketCap" not in stocks_df.columns:
+            stocks_df["marketCap"] = pd.NA
+        if "dividendYield" not in stocks_df.columns:
+            stocks_df["dividendYield"] = pd.NA
 
         stocks_df["group"] = stocks_df["group"].fillna("").astype(str).str.strip()
         stocks_df["weight"] = pd.to_numeric(stocks_df["weight"], errors="coerce")
+        stocks_df["marketCap"] = pd.to_numeric(stocks_df["marketCap"], errors="coerce")
+        stocks_df["dividendYield"] = pd.to_numeric(stocks_df["dividendYield"], errors="coerce")
 
-        # 검색 및 필터 UI
-        col_search, col_asset, col_group = st.columns([3, 1, 1])
+        # 1. 상단 KPI 대시보드 카드 배치
+        total_tracked = stocks_df["symbol"].nunique()
+        sp500_count = stocks_df[stocks_df["group"] == "S&P"]["symbol"].nunique()
+        nasdaq_count = stocks_df[stocks_df["group"] == "Nasdaq"]["symbol"].nunique()
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("총 수집 배당자산", f"{total_tracked}개")
+        c2.metric("S&P 500 배당주", f"{sp500_count}개")
+        c3.metric("Nasdaq 100 배당주", f"{nasdaq_count}개")
+        st.markdown("<div style='padding-top: 15px;'></div>", unsafe_allow_html=True)
+
+        # 2. 검색 및 필터 UI
+        col_search, col_group, col_sort = st.columns([3, 2, 2])
         with col_search:
-            search_query = st.text_input("종목 검색 (티커 또는 회사명)", "").strip().upper()
-        with col_asset:
-            asset_filter = st.selectbox("자산 분류 필터", ["전체", "주식", "ETF 구성종목"])
+            search_query = st.text_input("🔍 종목 검색 (티커 또는 회사명)", "").strip().upper()
         with col_group:
             preferred = ["S&P", "Nasdaq", "SCHD", "VIG", "DGRO"]
             groups = [g for g in stocks_df["group"].dropna().unique().tolist() if str(g).strip()]
             group_ordered = [g for g in preferred if g in groups] + sorted([g for g in groups if g not in preferred])
             group_filter = st.selectbox("그룹 필터", ["전체"] + group_ordered)
 
-        filtered_df = stocks_df.copy()
         etf_groups = ["SCHD", "VIG", "DGRO"]
 
-        # 필터 적용
-        if asset_filter == "ETF 구성종목":
-            filtered_df = filtered_df[filtered_df["group"].isin(etf_groups)]
-        elif asset_filter == "주식":
-            filtered_df = filtered_df[~filtered_df["group"].isin(etf_groups)]
+        # 정렬 기준 옵션 동적 구성 (ETF 선택 시 비중 순 추가)
+        sort_options = ["시가총액 순", "배당률 순", "티커 순"]
+        if group_filter in etf_groups:
+            sort_options.insert(2, "비중 순")
 
+        with col_sort:
+            sort_by = st.selectbox("정렬 기준", sort_options)
+
+        filtered_df = stocks_df.copy()
+
+        # 필터 적용
         if group_filter != "전체":
             filtered_df = filtered_df[filtered_df["group"] == group_filter]
 
@@ -576,65 +636,376 @@ elif st.session_state.menu == "📋 전체 종목 리스트":
                 | filtered_df["companyName"].astype(str).str.contains(search_query, case=False, na=False)
             ]
 
-        st.markdown(f"**총 {len(filtered_df)}개의 배당 자산이 조회되었습니다.**")
+        # 정렬 규칙 적용 (1단계: 임시 정렬 처리 - 대표 그룹화 이후 2단계 최종 정렬 수행)
 
-        # 종목 빠른 분석 연계
-        selected_ticker = st.selectbox("📊 상세 차트 분석으로 이동할 종목 선택", ["선택 안 함"] + filtered_df["symbol"].tolist())
-        if selected_ticker != "선택 안 함":
-            st.session_state.ticker = selected_ticker
-            st.session_state.menu = "📊 개별 종목 분석"
-            st.rerun()
+        # CSS Style Inject: 상태 전환(미선택/선택)과 무관하게 동일한 인스펙터 셸 스타일 유지
+        st.markdown("""
+<style>
+/* 표식이 있는 가장 안쪽 상자 스타일 */
+div[data-testid="stVerticalBlock"]:has(span.inspector-marker):not(:has(div[data-testid="stVerticalBlock"] span.inspector-marker)) {
+    background-color: #f0f9ff !important;
+    border: 1px solid #bae6fd !important;
+    border-radius: 12px !important;
+    padding: 20px 24px !important;
+    box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05) !important;
+    margin-bottom: 20px !important;
+    gap: 0px !important;
+    
+    /* 상자 자체도 너비를 제한 */
+    box-sizing: border-box !important;
+    width: 100% !important;
+    min-width: 0 !important;
+    overflow: hidden !important;
+}
 
-        # 테이블 표시
-        display_df = filtered_df.copy()
+/* 폼(Form) 요소의 기본 하단 마진을 제거하여 하단 패딩 확보 */
+div[data-testid="stVerticalBlock"]:has(span.inspector-marker):not(:has(div[data-testid="stVerticalBlock"] span.inspector-marker)) form {
+    margin-bottom: 0 !important;
+}
+
+/* 인스펙터 열(Column) 높이 균등화 및 하단 정렬 */
+
+/* 1단계: 열 자체를 flex column 컨테이너로 전환 */
+div[data-testid="stVerticalBlock"]:has(span.inspector-marker):not(:has(div[data-testid="stVerticalBlock"] span.inspector-marker)) [data-testid="column"] {
+    display: flex !important;
+    flex-direction: column !important;
+}
+
+/* 2단계: 열의 직계 자식(래퍼 div)을 열 전체 높이로 늘림 — 핵심 수정 */
+div[data-testid="stVerticalBlock"]:has(span.inspector-marker):not(:has(div[data-testid="stVerticalBlock"] span.inspector-marker)) [data-testid="column"] > * {
+    flex: 1 !important;
+    display: flex !important;
+    flex-direction: column !important;
+}
+
+/* 3단계: 래퍼 안의 stVerticalBlock도 동일하게 늘림 */
+div[data-testid="stVerticalBlock"]:has(span.inspector-marker):not(:has(div[data-testid="stVerticalBlock"] span.inspector-marker)) [data-testid="column"] div[data-testid="stVerticalBlock"] {
+    flex: 1 !important;
+    display: flex !important;
+    flex-direction: column !important;
+}
+
+/* 4단계: 각 열의 마지막 자식을 바닥으로 밀어서 정렬 (특이성 강화) */
+div[data-testid="stVerticalBlock"]:has(span.inspector-marker):not(:has(div[data-testid="stVerticalBlock"] span.inspector-marker)) [data-testid="column"] div[data-testid="stVerticalBlock"] > *:last-child {
+    margin-top: auto !important;
+}
+
+/* 숨겨진 inspector-marker를 감싸는 래퍼 element-container의 공간을 완전히 제거 */
+div[data-testid="stVerticalBlock"]:has(span.inspector-marker):not(:has(div[data-testid="stVerticalBlock"] span.inspector-marker)) > div:has(span.inspector-marker) {
+    height: 0 !important;
+    min-height: 0 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    overflow: hidden !important;
+}
+
+/* 컨테이너 내부의 모든 하위 래퍼 요소가 부모 패딩 영역을 초과하지 않도록 강제 */
+div[data-testid="stVerticalBlock"]:has(span.inspector-marker):not(:has(div[data-testid="stVerticalBlock"] span.inspector-marker)) > div,
+div[data-testid="stVerticalBlock"]:has(span.inspector-marker):not(:has(div[data-testid="stVerticalBlock"] span.inspector-marker)) div[data-testid="element-container"],
+div[data-testid="stVerticalBlock"]:has(span.inspector-marker):not(:has(div[data-testid="stVerticalBlock"] span.inspector-marker)) div[data-testid="stMarkdownContainer"],
+div[data-testid="stVerticalBlock"]:has(span.inspector-marker):not(:has(div[data-testid="stVerticalBlock"] span.inspector-marker)) div[data-testid="stMarkdown"],
+div[data-testid="stVerticalBlock"]:has(span.inspector-marker):not(:has(div[data-testid="stVerticalBlock"] span.inspector-marker)) .stMarkdown {
+    max-width: 100% !important;
+    min-width: 0 !important;
+    margin: 0 !important;
+    box-sizing: border-box !important;
+}
+
+/* 텍스트 폰트 색상 및 크기 지정 */
+.inspector-guide-text {
+    color: #0c4a6e !important;
+    font-size: 0.95rem !important;
+    font-weight: 500 !important;
+    margin: 0 !important;
+    max-width: 100% !important;
+    box-sizing: border-box !important;
+}
+</style>
+        """, unsafe_allow_html=True)
+
+        # 3. 인스펙터 패널용 빈 컨테이너 생성 (테이블 위에 렌더링되도록 플레이스홀더 지정)
+        inspector_placeholder = st.empty()
+        st.markdown("<div style='padding-top: 5px;'></div>", unsafe_allow_html=True)
+
+        # 4. 테이블 영역 렌더링 (가로 100% 사용, 자체 스크롤바 높이 고정)
+        st.markdown(f"**🔍 조건에 맞는 {len(filtered_df)}개의 배당 자산이 조회되었습니다.**")
+        
+        # 우선순위 정의 (낮을수록 우선순위 높음)
+        PRIORITY = {"SCHD": 1, "VIG": 2, "DGRO": 3, "S&P": 4, "Nasdaq": 5}
+
+        if group_filter == "전체":
+            # 중복 데이터 제거 및 그룹 병합 (시가총액, 배당률도 max로 보존)
+            grouped = filtered_df.groupby("symbol").agg({
+                "companyName": "first",
+                "lastDividend": "max",
+                "marketCap": "max",
+                "dividendYield": "max",
+                "weight": "max",
+                "group": lambda x: list(set(str(val).strip() for val in x if str(val).strip()))
+            }).reset_index()
+
+            def format_group_display(g_list):
+                if not g_list:
+                    return "-"
+                sorted_g = sorted(g_list, key=lambda x: PRIORITY.get(x, 99))
+                rep = sorted_g[0]
+                if len(sorted_g) > 1:
+                    return f"{rep} 외 {len(sorted_g) - 1}"
+                return rep
+
+            grouped["group_full"] = grouped["group"].apply(lambda x: ", ".join(sorted(x, key=lambda val: PRIORITY.get(val, 99))))
+            grouped["group"] = grouped["group"].apply(format_group_display)
+            display_df = grouped
+        else:
+            display_df = filtered_df.copy()
+            display_df["group_full"] = display_df["group"]
+
+        # 정렬 기준(sort_by)에 따라 정렬 실행
+        if sort_by == "시가총액 순":
+            display_df = display_df.sort_values(by="marketCap", ascending=False, na_position="last")
+        elif sort_by == "배당률 순":
+            display_df = display_df.sort_values(by="dividendYield", ascending=False, na_position="last")
+        elif sort_by == "비중 순":
+            display_df = display_df.sort_values(by="weight", ascending=False, na_position="last")
+        elif sort_by == "티커 순":
+            display_df = display_df.sort_values(by="symbol", ascending=True)
+
+        # 시가총액 단위 포맷팅 함수 정의 및 변환 적용
+        def format_market_cap(val):
+            if pd.isna(val) or val <= 0:
+                return "-"
+            if val >= 1e12:
+                return f"${val / 1e12:.2f}T"
+            if val >= 1e9:
+                return f"${val / 1e9:.2f}B"
+            if val >= 1e6:
+                return f"${val / 1e6:.2f}M"
+            return f"${val:,.0f}"
+
+        # 배당률 퍼센트 포맷팅 함수 정의 및 변환 적용
+        def format_dividend_yield(val):
+            if pd.isna(val) or val <= 0:
+                return "-"
+            return f"{val:.2f}%"
+
+        display_df["formatted_cap"] = display_df["marketCap"].apply(format_market_cap)
+        display_df["formatted_yield"] = display_df["dividendYield"].apply(format_dividend_yield)
+
+        display_df.insert(0, "선택", False)
+        
         display_df = display_df.rename(columns={
             "symbol": "티커",
             "companyName": "회사명",
-            "lastDividend": "최근 주당 배당금 ($)",
-            "stock_type": "자산 유형",
             "group": "그룹",
+            "formatted_cap": "시가총액",
+            "formatted_yield": "배당률",
             "weight": "비중(%)",
-            "updated_at": "동기화 일자",
         })
 
-        columns_to_show = ["티커", "회사명", "최근 주당 배당금 ($)", "자산 유형", "그룹", "동기화 일자"]
-        if group_filter in etf_groups or asset_filter == "ETF 구성종목":
-            columns_to_show.insert(5, "비중(%)")
 
-        st.dataframe(
+        columns_to_show = ["선택", "티커", "회사명", "그룹", "시가총액", "배당률"]
+        if group_filter in etf_groups:
+            columns_to_show.insert(6, "비중(%)")
+
+        # st.data_editor로 렌더링 (자체 스크롤바 부여)
+        edited_df = st.data_editor(
             display_df[columns_to_show],
             use_container_width=True,
             hide_index=True,
+            height=320,  # 스크롤 방지를 위해 높이 제한 고정
             column_config={
-                "최근 주당 배당금 ($)": st.column_config.NumberColumn("최근 주당 배당금 ($)", format="$%.4f"),
-                "비중(%)": st.column_config.NumberColumn("비중(%)", format="%.4f"),
+                "선택": st.column_config.CheckboxColumn("", width=40, default=False),
+                "티커": st.column_config.TextColumn("티커", width=60),
+                "회사명": st.column_config.TextColumn("회사명", width="medium"), # medium 고정으로 가로 스크롤 방지
+                "그룹": st.column_config.TextColumn("그룹", width=100),
+                "시가총액": st.column_config.TextColumn("시가총액", width=90),
+                "배당률": st.column_config.TextColumn("배당률", width=80),
+                "비중(%)": st.column_config.NumberColumn("비중(%)", format="%.4f%%", width=70),
             },
+            disabled=["티커", "회사명", "그룹", "시가총액", "배당률", "비중(%)"],
+            key="stocks_list_editor"
         )
+
+        # 5. 테이블의 선택 이벤트 감지 후 플레이스홀더에 동적으로 인스펙터 렌더링
+        selected_rows = edited_df[edited_df["선택"] == True]
+        
+        with inspector_placeholder.container():
+            # 단일 셸 컨테이너를 유지하고 내부 콘텐츠만 상태별로 전환
+            st.markdown('<span class="inspector-marker" style="display:none;">m</span>', unsafe_allow_html=True)
+            if not selected_rows.empty:
+                st.markdown("<h4 style='font-size: 1.05rem; font-weight: 700; margin: 0 0 10px 0; color: #1e3a8a;'>🔍 선택 종목 상세 제어 패널 (Inspector)</h4>", unsafe_allow_html=True)
+                
+                selected_stock = selected_rows.iloc[-1]
+                sel_ticker = selected_stock["티커"]
+                sel_name = selected_stock["회사명"]
+                
+                # group_full 정보 추출 및 개별 그룹 파싱
+                # 만약 group_full이 없으면 기존 그룹을 가져옴
+                sel_group_full = selected_stock["group_full"] if "group_full" in selected_stock else selected_stock["그룹"]
+                sel_groups = [g.strip() for g in str(sel_group_full).split(",") if g.strip()]
+
+                # 그룹별 색상 뱃지 스타일 정의
+                BADGE_STYLES = {
+                    "SCHD": "background-color: #e0f2fe; color: #0369a1; border: 1px solid #bae6fd;",
+                    "VIG": "background-color: #f3e8ff; color: #6b21a8; border: 1px solid #e9d5ff;",
+                    "DGRO": "background-color: #ecfdf5; color: #065f46; border: 1px solid #a7f3d0;",
+                    "S&P": "background-color: #ffedd5; color: #9a3412; border: 1px solid #fed7aa;",
+                    "Nasdaq": "background-color: #f1f5f9; color: #334155; border: 1px solid #e2e8f0;"
+                }
+
+                badge_htmls = []
+                for g in sel_groups:
+                    style = BADGE_STYLES.get(g, "background-color: #f1f5f9; color: #334155; border: 1px solid #e2e8f0;")
+                    badge_htmls.append(f'<span style="{style} padding: 2px 10px; border-radius: 20px; font-size: 0.68rem; font-weight: 700; margin-right: 4px; margin-bottom: 4px; display: inline-block;">{g}</span>')
+                badges_combined = "".join(badge_htmls)
+
+                sel_market_cap = selected_stock["시가총액"]
+                sel_yield = selected_stock["배당률"]
+
+                c_ins1, c_ins2, c_ins3 = st.columns([1, 1, 1])
+                
+                with c_ins1:
+                    st.caption("🏷️ 종목 요약 프로필")
+                    st.markdown(f"""
+                    <div style="text-align: left; padding: 0; margin: 0;">
+                        <h3 style="margin: 0; padding: 0; color: #0f172a; font-weight: 800; font-size: 1.5rem; letter-spacing: -0.01em; line-height: 1.1;">{sel_ticker}</h3>
+                        <p style="margin: 5px 0 6px 0; font-size: 0.8rem; font-weight: 500; color: #475569; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; height: 32px; line-height: 1.25;">{sel_name}</p>
+                        <div style="font-size: 0.72rem; font-weight: 600; color: #64748b; margin-bottom: 2px;">🏛️ 시가총액: <span style="color: #0f172a; font-weight: 700;">{sel_market_cap}</span></div>
+                        <div style="font-size: 0.72rem; font-weight: 600; color: #64748b; margin-bottom: 8px;">💰 배당수익률: <span style="color: #16a34a; font-weight: 700;">{sel_yield}</span></div>
+                        <div style="display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin: 0; padding: 0;">
+                            {badges_combined}
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                with c_ins2:
+                    st.caption("📝 신속 제어 및 분석")
+                    st.markdown("<div style='padding-top: 5px;'></div>", unsafe_allow_html=True)
+                    
+                    # 1. 상세 차트 분석 이동
+                    if st.button("📊 상세 차트 분석 이동", use_container_width=True, type="primary"):
+                        st.session_state.ticker = sel_ticker
+                        st.session_state.menu = "📊 개별 종목 분석"
+                        st.cache_data.clear()
+                        st.rerun()
+                    
+                    # 2. 관심종목 토글
+                    watchlist = get_watchlist_cached()
+                    is_in_wl = sel_ticker in watchlist
+                    if is_in_wl:
+                        if st.button("⭐ 관심 종목 해제", use_container_width=True):
+                            sh.remove_from_watchlist(sel_ticker)
+                            st.cache_data.clear()
+                            st.toast(f"⭐ {sel_ticker} 관심 종목 해제 완료!")
+                            st.rerun()
+                    else:
+                        if st.button("⭐ 관심 종목 등록", use_container_width=True):
+                            sh.add_to_watchlist(sel_ticker)
+                            st.cache_data.clear()
+                            st.toast(f"⭐ {sel_ticker} 관심 종목 등록 완료!")
+                            st.rerun()
+                            
+                with c_ins3:
+                    # 3열: 포트폴리오 관리 (caption 헤더로 통일하여 베이스라인을 일치시킴)
+                    portfolio_df = get_portfolio_cached()
+                    in_portfolio = sel_ticker in portfolio_df['symbol'].values
+                    p_shares = 0.0
+                    p_price = 0.0
+                    
+                    if in_portfolio:
+                        row = portfolio_df[portfolio_df['symbol'] == sel_ticker].iloc[0]
+                        p_shares = float(row['shares'])
+                        p_price = float(row['purchase_price'])
+                        status_tag = f"<span style='font-size:0.72rem;color:#059669;font-weight:700;'>(보유: {p_shares}주)</span>"
+                    else:
+                        status_tag = "<span style='font-size:0.72rem;color:#64748b;font-weight:700;'>(미보유)</span>"
+                    
+                    st.markdown(f"<div style='font-size: 0.8rem; color: #475569; margin-bottom: 2px;'>💼 포트폴리오 자산 {status_tag}</div>", unsafe_allow_html=True)
+                    
+                    with st.form("quick_pf_form", border=False):
+                        col_form1, col_form2 = st.columns(2)
+                        with col_form1:
+                            shares_in = st.number_input("수량", min_value=0.0, value=p_shares, step=0.1)
+                        with col_form2:
+                            price_in = st.number_input("평단 ($)", min_value=0.0, value=p_price, step=0.01)
+                        pf_submit = st.form_submit_button("💼 포트폴리오 저장/수정", use_container_width=True)
+                        if pf_submit:
+                            if shares_in > 0:
+                                sh.save_portfolio(sel_ticker, shares_in, price_in)
+                                st.cache_data.clear()
+                                st.toast(f"💼 {sel_ticker} {shares_in}주 저장 완료!")
+                                st.rerun()
+                            else:
+                                if in_portfolio:
+                                    sh.remove_from_portfolio(sel_ticker)
+                                    st.cache_data.clear()
+                                    st.toast(f"💼 {sel_ticker} 포트폴리오에서 삭제됨")
+                                    st.rerun()
+            else:
+                st.markdown('''
+                <div class="inspector-guide-text" style="width: 100% !important; max-width: 100% !important; white-space: normal !important; word-break: break-all !important; overflow-wrap: break-word !important; box-sizing: border-box !important;">
+                    💡 아래 표에서 종목의 '선택' 체크박스를 누르시면 이곳에 상세 분석 및 제어 패널(차트이동, 관심종목 토글, 자산 입력)이 즉시 펼쳐집니다.
+                </div>
+                ''', unsafe_allow_html=True)
 
     st.divider()
     st.subheader("🔄 데이터 실시간 강제 동기화")
-    st.markdown("Wikipedia와 무료 소스를 참조하여 S&P 500, 나스닥 100, SCHD/VIG/DGRO 구성종목 데이터를 동기화합니다. (약 30~120초 소요)")
-    if st.button("🔄 종목 리스트 및 배당정보 수동 업데이트", use_container_width=True):
-        with st.spinner("웹 스크레이퍼 및 yfinance를 실행하여 구글 시트 데이터를 동기화하는 중..."):
-            try:
-                import fetch_dividend_stocks as fds
-                fds.run_update()
+    st.markdown("Wikipedia와 무료 소스를 참조하여 S&P 500, 나스닥 100, SCHD/VIG/DGRO 구성종목 데이터를 동기화합니다.")
+    
+    # 5. 동기화 옵션 체크박스 그리드 및 Form 구성 (API 429 방지 및 시간정보 제공)
+    with st.form("sync_form", clear_on_submit=False):
+        st.markdown("##### ⚙️ 동기화 대상 그룹 선택")
+        c_sync1, c_sync2, c_sync3 = st.columns(3)
+        with c_sync1:
+            sync_sp = st.checkbox("S&P 500 지수", value=True, help="약 500개 종목, 약 2분 소요")
+            st.caption(f"🕒 최근 동기화: {group_times.get('S&P', '-')}")
+            st.markdown("<div style='padding-top: 10px;'></div>", unsafe_allow_html=True)
+            sync_nas = st.checkbox("Nasdaq 100 지수", value=True, help="약 100개 종목, 약 30초 소요")
+            st.caption(f"🕒 최근 동기화: {group_times.get('Nasdaq', '-')}")
+        with c_sync2:
+            sync_schd = st.checkbox("SCHD ETF", value=True, help="약 100개 종목, 약 30초 소요")
+            st.caption(f"🕒 최근 동기화: {group_times.get('SCHD', '-')}")
+            st.markdown("<div style='padding-top: 10px;'></div>", unsafe_allow_html=True)
+            sync_vig = st.checkbox("VIG ETF", value=True, help="약 300개 종목, 약 1분 소요")
+            st.caption(f"🕒 최근 동기화: {group_times.get('VIG', '-')}")
+        with c_sync3:
+            sync_dgro = st.checkbox("DGRO ETF", value=True, help="약 400개 종목, 약 1분 소요")
+            st.caption(f"🕒 최근 동기화: {group_times.get('DGRO', '-')}")
+            
+        submit_sync = st.form_submit_button("🔄 선택된 그룹 배당 정보 수동 업데이트", use_container_width=True)
 
-                success_groups = getattr(fds, "LAST_SUCCESS_GROUPS", [])
-                failed_groups = getattr(fds, "LAST_FAILED_GROUPS", [])
+    if submit_sync:
+        selected_sync_groups = []
+        if sync_sp: selected_sync_groups.append("S&P")
+        if sync_nas: selected_sync_groups.append("Nasdaq")
+        if sync_schd: selected_sync_groups.append("SCHD")
+        if sync_vig: selected_sync_groups.append("VIG")
+        if sync_dgro: selected_sync_groups.append("DGRO")
 
-                if success_groups:
-                    st.info(f"성공 그룹: {', '.join(success_groups)}")
-                if failed_groups:
-                    st.warning(f"실패 그룹(부분 실패): {', '.join(failed_groups)}")
+        if not selected_sync_groups:
+            st.warning("동기화할 그룹을 하나 이상 선택해 주세요.")
+        else:
+            with st.spinner("웹 스크레이퍼 및 yfinance를 실행하여 구글 시트 데이터를 동기화하는 중..."):
+                try:
+                    import fetch_dividend_stocks as fds
+                    fds.run_update(target_groups=selected_sync_groups)
 
-                if failed_groups:
-                    st.success("구글 시트와 부분 동기화가 완료되었습니다.")
-                else:
-                    st.success("구글 시트와 동기화가 성공적으로 완료되었습니다!")
-                st.rerun()
-            except Exception as e:
-                st.error(f"동기화 중 오류 발생: {e}")
+                    success_groups = getattr(fds, "LAST_SUCCESS_GROUPS", [])
+                    failed_groups = getattr(fds, "LAST_FAILED_GROUPS", [])
+
+                    if success_groups:
+                        st.info(f"성공 그룹: {', '.join(success_groups)}")
+                    if failed_groups:
+                        st.warning(f"실패 그룹: {', '.join(failed_groups)}")
+
+                    if success_groups:
+                        st.cache_data.clear()
+                        st.success("구글 시트 동기화가 성공적으로 완료되었습니다!")
+                        st.rerun()
+                    else:
+                        st.error("모든 선택 그룹의 동기화에 실패했습니다.")
+                except Exception as e:
+                    st.error(f"동기화 중 오류 발생: {e}")
 
 # 3. 내 자산 & 관심 종목 페이지
 elif st.session_state.menu == "💼 내 자산 & 관심 종목":
@@ -643,11 +1014,11 @@ elif st.session_state.menu == "💼 내 자산 & 관심 종목":
     tab_pf, tab_wl = st.tabs(["💼 내 포트폴리오", "⭐ 관심 종목"])
     
     # 캐시된 종목 마스터 리스트 로딩
-    stocks_df = sh.get_stocks()
+    stocks_df = get_stocks_cached()
     
     with tab_pf:
         st.subheader("보유 자산 현황 요약")
-        portfolio_df = sh.get_portfolio()
+        portfolio_df = get_portfolio_cached()
         
         if portfolio_df.empty:
             st.info("포트폴리오가 현재 비어 있습니다. '📊 개별 종목 분석' 페이지에서 자산을 추가해 주세요.")
@@ -761,12 +1132,13 @@ elif st.session_state.menu == "💼 내 자산 & 관심 종목":
                 if del_ticker != "선택 안 함":
                     if st.button("🗑️ 선택 자산 삭제", use_container_width=True):
                         sh.remove_from_portfolio(del_ticker)
+                        st.cache_data.clear()
                         st.success(f"{del_ticker} 삭제 성공!")
                         st.rerun()
 
     with tab_wl:
         st.subheader("⭐ 내 관심 종목 목록")
-        watchlist = sh.get_watchlist()
+        watchlist = get_watchlist_cached()
         
         if not watchlist:
             st.info("관심 등록된 종목이 없습니다. '📊 개별 종목 분석' 페이지에서 추가해 주세요.")

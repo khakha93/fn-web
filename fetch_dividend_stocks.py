@@ -14,8 +14,7 @@ import sheets_helper
 LAST_SUCCESS_GROUPS = []
 LAST_FAILED_GROUPS = []
 ETF_GROUPS = ["SCHD", "VIG", "DGRO"]
-HOLDINGS_COLUMNS = ["symbol", "companyName", "lastDividend", "stock_type", "group", "weight"]
-CACHE_FILE = "scratch/etf_holdings_cache.csv"
+HOLDINGS_COLUMNS = ["symbol", "companyName", "lastDividend", "stock_type", "group", "weight", "marketCap", "dividendYield"]
 INVALID_SYMBOLS = {
     "NAN",
     "SHOW",
@@ -60,6 +59,8 @@ def _normalize_holdings_df(df):
     out["stock_type"] = out["stock_type"].fillna("STOCK").astype(str).str.strip().str.upper()
     out["group"] = out["group"].fillna("").astype(str).str.strip()
     out["weight"] = pd.to_numeric(out["weight"], errors="coerce")
+    out["marketCap"] = pd.to_numeric(out["marketCap"], errors="coerce")
+    out["dividendYield"] = pd.to_numeric(out["dividendYield"], errors="coerce")
     out = out[out["symbol"] != ""]
     out = out[out["group"] != ""]
     out = out[~out["symbol"].isin(INVALID_SYMBOLS)]
@@ -84,44 +85,7 @@ def _is_quality_holdings(df):
     return len(df) >= 10 and weight_count >= 5
 
 
-def _load_cached_etf_holdings(etf):
-    if not os.path.exists(CACHE_FILE):
-        return _empty_holdings_df()
 
-    try:
-        cache_df = pd.read_csv(CACHE_FILE)
-        cache_df = _normalize_holdings_df(cache_df)
-        out = cache_df[cache_df["group"] == etf].copy()
-        if _is_quality_holdings(out):
-            print(f"{etf}: loaded ETF holdings from cache ({len(out)} rows).")
-            return out
-    except Exception as e:
-        print(f"{etf} cache load failed: {e}")
-
-    return _empty_holdings_df()
-
-
-def _save_cached_etf_holdings(df_etf):
-    if df_etf is None or df_etf.empty:
-        return
-
-    new_df = _normalize_holdings_df(df_etf)
-    if new_df.empty:
-        return
-
-    os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
-
-    if os.path.exists(CACHE_FILE):
-        try:
-            old_df = _normalize_holdings_df(pd.read_csv(CACHE_FILE))
-        except Exception:
-            old_df = _empty_holdings_df()
-    else:
-        old_df = _empty_holdings_df()
-
-    updated = pd.concat([old_df, new_df], ignore_index=True)
-    updated = updated.drop_duplicates(subset=["group", "symbol"], keep="last")
-    updated.to_csv(CACHE_FILE, index=False)
 
 
 def fetch_sp500_tickers(headers):
@@ -132,82 +96,186 @@ def fetch_sp500_tickers(headers):
         response.raise_for_status()
         tables = pd.read_html(StringIO(response.text))
         df = tables[0]
-        tickers = [str(t).replace(".", "-").strip().upper() for t in df["Symbol"].tolist()]
-        tickers = [t for t in tickers if t]
-        print(f"Found {len(tickers)} S&P 500 tickers.")
-        return tickers
+        ticker_map = {}
+        for _, row in df.iterrows():
+            ticker = str(row.get("Symbol", "")).replace(".", "-").strip().upper()
+            name = str(row.get("Security", ticker)).strip()
+            if ticker:
+                ticker_map[ticker] = name
+        print(f"Found {len(ticker_map)} S&P 500 tickers.")
+        return ticker_map
     except Exception as e:
         print(f"Error fetching S&P 500: {e}")
-        return []
+        return {}
 
 
 def fetch_nasdaq100_tickers(headers):
     print("Fetching NASDAQ 100 tickers from Wikipedia...")
     try:
-        url = "https://en.wikipedia.org/wiki/Nasdaq-100"
+        url = "https://en.wikipedia.org/wiki/List_of_NASDAQ-100_companies"
         response = requests.get(url, headers=headers, timeout=20)
         response.raise_for_status()
         tables = pd.read_html(StringIO(response.text))
         for t in tables:
+            ticker_col = None
             if "Ticker" in t.columns:
-                tickers = [str(symbol).replace(".", "-").strip().upper() for symbol in t["Ticker"].tolist()]
-                tickers = [x for x in tickers if x]
-                print(f"Found {len(tickers)} NASDAQ 100 tickers.")
-                return tickers
-            if "Symbol" in t.columns:
-                tickers = [str(symbol).replace(".", "-").strip().upper() for symbol in t["Symbol"].tolist()]
-                tickers = [x for x in tickers if x]
-                print(f"Found {len(tickers)} NASDAQ 100 tickers.")
-                return tickers
+                ticker_col = "Ticker"
+            elif "Symbol" in t.columns:
+                ticker_col = "Symbol"
+            
+            company_col = None
+            if "Company" in t.columns:
+                company_col = "Company"
+            elif "Security" in t.columns:
+                company_col = "Security"
+
+            if ticker_col:
+                ticker_map = {}
+                for _, row in t.iterrows():
+                    ticker = str(row[ticker_col]).replace(".", "-").strip().upper()
+                    name = str(row[company_col]) if company_col else ticker
+                    if ticker:
+                        ticker_map[ticker] = name
+                print(f"Found {len(ticker_map)} NASDAQ 100 tickers.")
+                return ticker_map
     except Exception as e:
         print(f"Error fetching NASDAQ 100: {e}")
-    return []
+    return {}
 
 
-def check_dividend_status(ticker):
-    try:
-        t = yf.Ticker(ticker)
-        divs = t.dividends
-        if len(divs) > 0:
-            last_div = divs.iloc[-1]
-            name = ticker
-            try:
-                name = t.info.get("longName", ticker)
-            except Exception:
-                pass
-            return {"symbol": ticker, "companyName": name, "lastDividend": float(last_div)}
-    except Exception:
-        pass
-    return None
+def _chunk_list(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
 
 
-def build_index_group_rows(tickers, group_name, max_workers=15):
+def fetch_market_caps_in_parallel(tickers):
+    """
+    고유 티커 목록 전체에 대하여 yfinance의 fast_info 속성을 병렬로 초고속 조회하여
+    {ticker: market_cap} 딕셔너리를 반환합니다.
+    """
+    tickers = sorted(list(set(tickers)))
+    market_caps = {}
     if not tickers:
+        return market_caps
+
+    print(f"Fetching market caps in parallel for {len(tickers)} tickers...")
+    
+    def fetch_single_cap(ticker):
+        try:
+            t = yf.Ticker(ticker)
+            # fast_info는 가볍고 빠른 호출용 속성
+            cap = getattr(t.fast_info, "market_cap", None)
+            if cap is not None:
+                return ticker, float(cap)
+            
+            # fallback
+            info_cap = t.info.get("marketCap", None)
+            if info_cap is not None:
+                return ticker, float(info_cap)
+        except Exception:
+            pass
+        return ticker, None
+
+    with ThreadPoolExecutor(max_workers=35) as executor:
+        futures = {executor.submit(fetch_single_cap, ticker): ticker for ticker in tickers}
+        for fut in as_completed(futures):
+            ticker, cap = fut.result()
+            if cap is not None:
+                market_caps[ticker] = cap
+
+    print(f"Market cap fetch complete: found {len(market_caps)} records.")
+    return market_caps
+
+
+def fetch_active_dividends_in_batch(tickers, company_name_dict):
+    """
+    Given a list of tickers, downloads their dividend data in batch chunks,
+    filters out inactive ones (no dividend in the last 1 year),
+    and returns a dictionary of {ticker: last_dividend_value}.
+    """
+    tickers = sorted(list(set(tickers)))
+    active_divs = {}
+    if not tickers:
+        return active_divs
+
+    print(f"Downloading batch dividends for {len(tickers)} tickers...")
+    import datetime
+    now = datetime.datetime.now()
+
+    chunks = list(_chunk_list(tickers, 150))
+    for chunk_idx, chunk in enumerate(chunks):
+        print(f"Downloading chunk {chunk_idx + 1}/{len(chunks)} ({len(chunk)} tickers)...")
+        try:
+            df_batch = yf.download(chunk, period="1y", actions=True, group_by="ticker", progress=False)
+
+            for ticker in chunk:
+                try:
+                    if isinstance(df_batch.columns, pd.MultiIndex):
+                        if ticker not in df_batch.columns.levels[0]:
+                            continue
+                        ticker_df = df_batch[ticker]
+                    else:
+                        ticker_df = df_batch
+
+                    div_history = ticker_df[ticker_df["Dividends"] > 0]
+                    if div_history.empty:
+                        continue
+
+                    last_date = div_history.index[-1]
+                    last_div = div_history["Dividends"].iloc[-1]
+
+                    # Filter: must be within recent 1 year (365 days)
+                    one_year_ago = now - datetime.timedelta(days=365)
+                    if last_date.tzinfo is not None:
+                        one_year_ago = one_year_ago.astimezone(last_date.tzinfo)
+
+                    if last_date < one_year_ago:
+                        continue
+
+                    # TTM 배당률(수익률) 연산
+                    current_price = 0.0
+                    if "Close" in ticker_df.columns:
+                        filled_close = ticker_df["Close"].ffill()
+                        if not filled_close.empty:
+                            current_price = float(filled_close.iloc[-1])
+
+                    annual_dividend = float(ticker_df["Dividends"].sum())
+                    div_yield = 0.0
+                    if current_price > 0:
+                        div_yield = (annual_dividend / current_price) * 100
+
+                    active_divs[ticker] = {
+                        "last_div": float(last_div),
+                        "yield": float(div_yield)
+                    }
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"Failed to download batch {chunk_idx + 1}: {e}")
+
+    print(f"Active dividend status check complete: found {len(active_divs)} dividend-paying stocks.")
+    return active_divs
+
+
+def build_index_group_rows(ticker_map, group_name, active_dividends_map, market_caps_map):
+    if not ticker_map:
         return _empty_holdings_df()
 
     rows = []
-    print(f"Checking dividend status for {group_name} tickers in parallel...")
-    start_time = time.time()
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(check_dividend_status, ticker): ticker for ticker in sorted(set(tickers))}
-        for future in as_completed(futures):
-            res = future.result()
-            if not res:
-                continue
+    for ticker, name in ticker_map.items():
+        if ticker in active_dividends_map:
             rows.append(
                 {
-                    "symbol": str(res["symbol"]).strip().upper(),
-                    "companyName": str(res.get("companyName") or res["symbol"]).strip(),
-                    "lastDividend": pd.to_numeric(res.get("lastDividend"), errors="coerce"),
+                    "symbol": ticker,
+                    "companyName": name,
+                    "lastDividend": active_dividends_map[ticker]["last_div"],
                     "stock_type": "STOCK",
                     "group": group_name,
                     "weight": pd.NA,
+                    "marketCap": market_caps_map.get(ticker, pd.NA),
+                    "dividendYield": active_dividends_map[ticker]["yield"],
                 }
             )
-
-    elapsed = time.time() - start_time
-    print(f"{group_name}: found {len(rows)} dividend-paying stocks in {elapsed:.2f} seconds.")
     return _normalize_holdings_df(pd.DataFrame(rows))
 
 
@@ -705,116 +773,36 @@ def _fetch_official_holdings(etf):
     return _empty_holdings_df()
 
 
-def _fetch_holdings_from_slickcharts(etf):
-    url = f"https://www.slickcharts.com/etf/{etf.upper()}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    }
-
-    try:
-        resp = requests.get(url, headers=headers, timeout=20)
-        resp.raise_for_status()
-        tables = pd.read_html(StringIO(resp.text), flavor="lxml")
-
-        rows = []
-        for table in tables:
-            rows.extend(_rows_from_holdings_table(table, etf))
-
-        if not rows:
-            return _empty_holdings_df()
-
-        deduped = {(r["symbol"], r["group"]): r for r in rows}
-        out = _normalize_holdings_df(pd.DataFrame(deduped.values()))
-        if not _is_quality_holdings(out):
-            return _empty_holdings_df()
-        return out
-    except Exception as e:
-        print(f"{etf} slickcharts fallback failed: {e}")
-        return _empty_holdings_df()
-
-
-def _fetch_holdings_from_yfinance(etf):
-    try:
-        t = yf.Ticker(etf)
-        fund_data = getattr(t, "funds_data", None)
-        top_holdings = getattr(fund_data, "top_holdings", None)
-
-        if top_holdings is None:
-            getter = getattr(t, "get_funds_data", None)
-            if callable(getter):
-                fd = getter()
-                top_holdings = getattr(fd, "top_holdings", None)
-
-        if top_holdings is None or getattr(top_holdings, "empty", True):
-            return _empty_holdings_df()
-
-        df = top_holdings.copy()
-        symbol_col = _pick_column(df.columns, ["symbol", "ticker", "holding"]) or df.columns[0]
-        weight_col = _pick_column(df.columns, ["holding percent", "weight", "percent", "portfolio", "% assets"])
-        name_col = _pick_column(df.columns, ["name", "holding", "security"])
-
-        rows = []
-        for _, row in df.iterrows():
-            symbol = _extract_symbol(row[symbol_col])
-            if not symbol:
-                continue
-            name = str(row[name_col]).strip() if name_col else symbol
-            weight = normalize_weight(row[weight_col], is_ratio=True) if weight_col else pd.NA
-            rows.append(
-                {
-                    "symbol": symbol,
-                    "companyName": name or symbol,
-                    "lastDividend": pd.NA,
-                    "stock_type": "STOCK",
-                    "group": etf,
-                    "weight": weight,
-                }
-            )
-
-        if not rows:
-            return _empty_holdings_df()
-
-        return _normalize_holdings_df(pd.DataFrame(rows))
-    except Exception as e:
-        print(f"{etf} yfinance fallback failed: {e}")
-        return _empty_holdings_df()
-
-
 def fetch_etf_constituents(etf):
-    print(f"Fetching ETF holdings for {etf} (official source first)...")
+    print(f"Fetching ETF holdings for {etf} (official source)...")
 
     df = _fetch_official_holdings(etf)
     if not df.empty:
         return df, "official"
 
-    print(f"No official-source holdings parsed for {etf}; trying slickcharts fallback.")
-    df = _fetch_holdings_from_slickcharts(etf)
-    if not df.empty:
-        return df, "slickcharts"
-
-    print(f"No slickcharts holdings parsed for {etf}; using yfinance fallback.")
-    df = _fetch_holdings_from_yfinance(etf)
-    if not df.empty:
-        return df, "yfinance"
-
     return _empty_holdings_df(), "failed"
 
 
-def fetch_dividend_etf_constituents():
+def fetch_dividend_etf_constituents(df_existing, target_etfs=None):
+    if target_etfs is None:
+        target_etfs = ETF_GROUPS
     frames = []
     success_groups = []
     failed_groups = []
 
-    for etf in ETF_GROUPS:
+    for etf in target_etfs:
         df, source = fetch_etf_constituents(etf)
         if df.empty:
-            cached_df = _load_cached_etf_holdings(etf)
+            # 1단계 웹 조회 실패 시 -> 구글 시트 기존 데이터에서 백업 추출
+            cached_df = pd.DataFrame()
+            if df_existing is not None and not df_existing.empty:
+                cached_df = df_existing[df_existing["group"] == etf].copy()
+
             if cached_df.empty:
                 failed_groups.append(etf)
-                print(f"{etf}: failed to fetch holdings from free sources and cache.")
+                print(f"{etf}: failed to fetch holdings from official source and no sheet backup available.")
                 continue
-            success_groups.append(f"{etf}(cache)")
+            success_groups.append(f"{etf}(sheet_backup)")
             frames.append(cached_df)
             continue
 
@@ -825,66 +813,188 @@ def fetch_dividend_etf_constituents():
         return _empty_holdings_df(), success_groups, failed_groups
 
     out = _normalize_holdings_df(pd.concat(frames, ignore_index=True))
-    live_df = out[out["group"].isin([g for g in ETF_GROUPS if f"{g}(cache)" not in success_groups])]
-    _save_cached_etf_holdings(live_df)
     return out, success_groups, failed_groups
 
 
-def run_update():
-    """배당 종목 정보를 업데이트하여 구글 시트에 저장합니다. ETF는 구성종목 기준으로 적재합니다."""
+def run_update(target_groups=None):
+    """배당 종목 정보를 업데이트하여 구글 시트에 저장합니다. target_groups가 있으면 부분 업데이트합니다."""
     global LAST_SUCCESS_GROUPS, LAST_FAILED_GROUPS
 
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
-    sp500_tickers = fetch_sp500_tickers(headers)
-    nasdaq100_tickers = fetch_nasdaq100_tickers(headers)
+    # 1. 구글 시트에서 기존 데이터 로딩
+    print("Loading existing stocks from Google Sheets...")
+    try:
+        df_existing = sheets_helper.get_stocks()
+    except Exception as e:
+        print(f"Failed to load existing stocks from Google Sheets: {e}")
+        df_existing = pd.DataFrame()
 
-    df_sp500 = build_index_group_rows(sp500_tickers, "S&P")
-    df_nasdaq = build_index_group_rows(nasdaq100_tickers, "Nasdaq")
+    ALL_GROUPS = ["S&P", "Nasdaq", "SCHD", "VIG", "DGRO"]
+    if not target_groups:
+        target_groups = ALL_GROUPS
+    else:
+        # 대소문자 매핑 및 검증
+        target_groups = [g for g in ALL_GROUPS if g.lower() in [tg.lower() for tg in target_groups]]
 
-    df_etf, etf_success, etf_failed = fetch_dividend_etf_constituents()
+    if not target_groups:
+        print("No valid target groups specified. Defaulting to all.")
+        target_groups = ALL_GROUPS
 
-    frames = [_normalize_holdings_df(df_sp500), _normalize_holdings_df(df_nasdaq), _normalize_holdings_df(df_etf)]
-    non_empty = [f for f in frames if f is not None and not f.empty]
+    print(f"Target groups for update: {target_groups}")
 
-    if not non_empty:
+    # 2. 각 그룹별 로우 수집 (티커 & 회사명 맵 확보)
+    sp500_map = {}
+    nasdaq_map = {}
+    df_etf_raw = pd.DataFrame()
+    etf_success = []
+    etf_failed = []
+    index_success_groups = []
+
+    if "S&P" in target_groups:
+        sp500_map = fetch_sp500_tickers(headers)
+        if not sp500_map and not df_existing.empty:
+            print("S&P 500 fetch from Wikipedia failed. Using existing S&P 500 tickers from sheet as backup...")
+            sp_existing = df_existing[df_existing["group"] == "S&P"]
+            sp500_map = {row["symbol"]: row["companyName"] for _, row in sp_existing.iterrows()}
+            if sp500_map:
+                index_success_groups.append("S&P(sheet_backup)")
+        elif sp500_map:
+            index_success_groups.append("S&P(official)")
+
+    if "Nasdaq" in target_groups:
+        nasdaq_map = fetch_nasdaq100_tickers(headers)
+        if not nasdaq_map and not df_existing.empty:
+            print("NASDAQ 100 fetch from Wikipedia failed. Using existing NASDAQ 100 tickers from sheet as backup...")
+            nas_existing = df_existing[df_existing["group"] == "Nasdaq"]
+            nasdaq_map = {row["symbol"]: row["companyName"] for _, row in nas_existing.iterrows()}
+            if nasdaq_map:
+                index_success_groups.append("Nasdaq(sheet_backup)")
+        elif nasdaq_map:
+            index_success_groups.append("Nasdaq(official)")
+    
+    target_etfs = [etf for etf in ETF_GROUPS if etf in target_groups]
+    if target_etfs:
+        df_etf_raw, etf_success, etf_failed = fetch_dividend_etf_constituents(df_existing, target_etfs)
+
+    # 3. 신규 수집하려는 티커 목록 취합
+    new_tickers = set()
+    if sp500_map:
+        new_tickers.update(sp500_map.keys())
+    if nasdaq_map:
+        new_tickers.update(nasdaq_map.keys())
+    if not df_etf_raw.empty:
+        new_tickers.update(df_etf_raw["symbol"].tolist())
+
+    # 4. 회사명 딕셔너리 통합
+    combined_name_map = {**sp500_map, **nasdaq_map}
+    if not df_etf_raw.empty:
+        for _, row in df_etf_raw.iterrows():
+            sym = row["symbol"]
+            if sym not in combined_name_map:
+                combined_name_map[sym] = row["companyName"]
+
+    # 5. 수집할 티커 세트에 대해 yfinance 배치 배당 조회 실행 및 시가총액 병렬 조회
+    active_dividends_map = {}
+    market_caps_map = {}
+    if new_tickers:
+        active_dividends_map = fetch_active_dividends_in_batch(new_tickers, combined_name_map)
+        market_caps_map = fetch_market_caps_in_parallel(new_tickers)
+
+    # 6. 각 그룹별 최종 데이터프레임 빌드
+    df_sp500 = pd.DataFrame()
+    df_nasdaq = pd.DataFrame()
+    df_etf = pd.DataFrame()
+
+    if "S&P" in target_groups and sp500_map:
+        df_sp500 = build_index_group_rows(sp500_map, "S&P", active_dividends_map, market_caps_map)
+    if "Nasdaq" in target_groups and nasdaq_map:
+        df_nasdaq = build_index_group_rows(nasdaq_map, "Nasdaq", active_dividends_map, market_caps_map)
+    if not df_etf_raw.empty:
+        # ETF 구성 종목 중 active 배당을 지급하는 종목만 남김
+        df_etf_filtered = df_etf_raw[df_etf_raw["symbol"].isin(active_dividends_map)].copy()
+        if not df_etf_filtered.empty:
+            df_etf_filtered["lastDividend"] = df_etf_filtered["symbol"].map(lambda s: active_dividends_map[s]["last_div"] if s in active_dividends_map else pd.NA)
+            df_etf_filtered["marketCap"] = df_etf_filtered["symbol"].map(market_caps_map)
+            df_etf_filtered["dividendYield"] = df_etf_filtered["symbol"].map(lambda s: active_dividends_map[s]["yield"] if s in active_dividends_map else pd.NA)
+            df_etf = _normalize_holdings_df(df_etf_filtered)
+
+    # 7. 신규 업데이트된 결과물 취합
+    new_frames = []
+    if not df_sp500.empty:
+        new_frames.append(df_sp500)
+    if not df_nasdaq.empty:
+        new_frames.append(df_nasdaq)
+    if not df_etf.empty:
+        new_frames.append(df_etf)
+
+    # 8. 기존 구글 시트 데이터 중 업데이트하지 '않은' 그룹 데이터 보존 (Read-Modify-Write)
+    success_groups = []
+    success_groups.extend(index_success_groups)
+    success_groups.extend(etf_success)
+
+    failed_groups = list(etf_failed)
+    if "S&P" in target_groups and df_sp500.empty:
+        failed_groups.append("S&P")
+    if "Nasdaq" in target_groups and df_nasdaq.empty:
+        failed_groups.append("Nasdaq")
+
+    df_preserved = pd.DataFrame()
+    # success_groups에 소스 구분자(예: '(official)', '(cache)')가 포함되어 있으므로 실제 그룹 이름으로 변환
+    clean_success_groups = []
+    for g in success_groups:
+        if "(" in g:
+            clean_success_groups.append(g.split("(")[0])
+        else:
+            clean_success_groups.append(g)
+
+    if not df_existing.empty:
+        # 성공적으로 신규 수집된 그룹을 기존 데이터에서 제외하고 보존
+        df_preserved = df_existing[~df_existing["group"].isin(clean_success_groups)].copy()
+
+    # 9. 보존된 기존 그룹 데이터 + 신규 업데이트 데이터를 병합
+    combined_list = []
+    if not df_preserved.empty:
+        combined_list.append(df_preserved)
+    combined_list.extend(new_frames)
+
+    if not combined_list:
         LAST_SUCCESS_GROUPS = []
-        LAST_FAILED_GROUPS = ["S&P", "Nasdaq"] + ETF_GROUPS
-        raise RuntimeError("수집 가능한 데이터가 없어 동기화를 중단했습니다.")
+        LAST_FAILED_GROUPS = target_groups
+        raise RuntimeError("수집 및 병합할 수 있는 데이터가 없습니다.")
 
-    df_combined = _normalize_holdings_df(pd.concat(non_empty, ignore_index=True))
+    df_combined = pd.concat(combined_list, ignore_index=True)
 
-    if not df_combined.empty:
-        df_combined["weight"] = pd.to_numeric(df_combined["weight"], errors="coerce")
-
+    # 10. 동기화 시각 업데이트 (신규 수집된 그룹 행에만 업데이트, 보존된 그룹 행은 기존 시각 유지)
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    df_combined["updated_at"] = now_str
 
-    df_combined = df_combined[df_combined["symbol"] != ""]
-    df_combined = df_combined[df_combined["group"] != ""]
+    # 임시로 updated_at 백업
+    updated_at_series = df_combined["updated_at"] if "updated_at" in df_combined.columns else pd.Series([""] * len(df_combined))
+
+    # 표준 필드 규격화 (updated_at 컬럼 유실됨)
+    df_combined = _normalize_holdings_df(df_combined)
+
+    # updated_at 다시 복원
+    df_combined["updated_at"] = updated_at_series.values
+
+    # 신규 성공 그룹의 updated_at을 최신 시간으로 업데이트
+    df_combined.loc[df_combined["group"].isin(clean_success_groups), "updated_at"] = now_str
+
+    # 비어있는 updated_at이 있으면 현재 시간으로 채움
+    df_combined.loc[df_combined["updated_at"].isna() | (df_combined["updated_at"] == ""), "updated_at"] = now_str
+
+    # 중복 제거 (그룹, 티커 기준)
     df_combined = df_combined.drop_duplicates(subset=["group", "symbol"], keep="first")
 
     if df_combined.empty:
         LAST_SUCCESS_GROUPS = []
-        LAST_FAILED_GROUPS = ["S&P", "Nasdaq"] + ETF_GROUPS
-        raise RuntimeError("정제 후 남은 데이터가 없어 동기화를 중단했습니다.")
+        LAST_FAILED_GROUPS = target_groups
+        raise RuntimeError("정제 후 동기화할 데이터가 존재하지 않습니다.")
 
+    # 11. 구글 시트 최종 일괄 동기화
     print("Syncing data to Google Sheets...")
     sheets_helper.save_stocks(df_combined)
     print("Google Sheets sync successful!")
-
-    success_groups = []
-    if not df_sp500.empty:
-        success_groups.append("S&P")
-    if not df_nasdaq.empty:
-        success_groups.append("Nasdaq")
-    success_groups.extend(etf_success)
-
-    failed_groups = list(etf_failed)
-    if df_sp500.empty:
-        failed_groups.append("S&P")
-    if df_nasdaq.empty:
-        failed_groups.append("Nasdaq")
 
     LAST_SUCCESS_GROUPS = success_groups
     LAST_FAILED_GROUPS = failed_groups

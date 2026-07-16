@@ -1,4 +1,4 @@
-﻿import streamlit as st
+import streamlit as st
 import gspread
 from gspread_dataframe import set_with_dataframe, get_as_dataframe
 import pandas as pd
@@ -11,6 +11,8 @@ STOCKS_COLUMNS = [
     "stock_type",
     "group",
     "weight",
+    "marketCap",
+    "dividendYield",
     "updated_at",
 ]
 
@@ -46,6 +48,8 @@ def _normalize_stocks_df(df):
     safe_df["stock_type"] = safe_df["stock_type"].fillna("STOCK").astype(str).str.strip().str.upper()
     safe_df["group"] = safe_df["group"].fillna("").astype(str).str.strip()
     safe_df["weight"] = pd.to_numeric(safe_df["weight"], errors="coerce")
+    safe_df["marketCap"] = pd.to_numeric(safe_df["marketCap"], errors="coerce")
+    safe_df["dividendYield"] = pd.to_numeric(safe_df["dividendYield"], errors="coerce")
     safe_df["updated_at"] = safe_df["updated_at"].fillna("").astype(str)
     return safe_df
 
