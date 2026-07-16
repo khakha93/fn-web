@@ -81,23 +81,75 @@ if st.session_state.menu == "📊 개별 종목 분석":
 
     @st.cache_data
     def get_stock_data(ticker):
-        # 데이터 가져오기
+        import os
+        import datetime
+
+        # 캐시 폴더 생성
+        os.makedirs("cache", exist_ok=True)
+        price_cache_path = f"cache/{ticker}_price.csv"
+        div_cache_path = f"cache/{ticker}_div.csv"
+
         session = dyf.get_yf_session()
-        df_price = yf.download(ticker, period="max", auto_adjust=False, session=session)
+
+        # 1. 주가 데이터 (df_price) 처리
+        df_price = None
+        if os.path.exists(price_cache_path):
+            try:
+                df_price = pd.read_csv(price_cache_path, index_col=0, parse_dates=True)
+                if isinstance(df_price.columns, pd.MultiIndex):
+                    df_price.columns = df_price.columns.droplevel(1)
+                
+                # 타임존 제거
+                df_price.index = df_price.index.tz_localize(None)
+                
+                # 마지막 캐시 날짜 확인
+                last_cached_date = df_price.index.max()
+                today = datetime.datetime.now().date()
+                
+                # 하루 이상 차이가 날 경우, 최근 5일치 데이터를 다운로드하여 병합
+                if (today - last_cached_date.date()).days >= 1:
+                    df_recent = yf.download(ticker, period="5d", auto_adjust=False, session=session)
+                    if not df_recent.empty:
+                        if isinstance(df_recent.columns, pd.MultiIndex):
+                            df_recent.columns = df_recent.columns.droplevel(1)
+                        df_recent.index = df_recent.index.tz_localize(None)
+                        
+                        df_price = pd.concat([df_price, df_recent])
+                        df_price = df_price[~df_price.index.duplicated(keep='last')].sort_index()
+                        df_price.to_csv(price_cache_path)
+            except Exception:
+                df_price = None
+
+        if df_price is None or df_price.empty:
+            df_price = yf.download(ticker, period="max", auto_adjust=False, session=session)
+            if isinstance(df_price.columns, pd.MultiIndex):
+                df_price.columns = df_price.columns.droplevel(1)
+            df_price.index = df_price.index.tz_localize(None)
+            df_price.to_csv(price_cache_path)
+
         df_close = df_price['Close'].copy()
-        
-        # 단일 티커 검색 시 MultiIndex 컬럼일 경우 평탄화
-        if isinstance(df_price.columns, pd.MultiIndex):
-            df_price.columns = df_price.columns.droplevel(1)
+
+        # 2. 배당 데이터 (df_div) 처리
+        df_div = None
+        if os.path.exists(div_cache_path):
+            try:
+                file_mtime = datetime.datetime.fromtimestamp(os.path.getmtime(div_cache_path))
+                # 배당 데이터는 자주 변하지 않으므로 3일간 캐시 유효
+                if datetime.datetime.now() - file_mtime < datetime.timedelta(days=3):
+                    df_div = pd.read_csv(div_cache_path, parse_dates=['Date'])
+            except Exception:
+                df_div = None
+
+        if df_div is None or df_div.empty:
+            df_div = dyf.get_yf_dividend_history(ticker, session=session)
+            df_div.to_csv(div_cache_path, index=False)
 
         # 배당수익률 지표 계산 로직
-        df_div = dyf.get_yf_dividend_history(ticker, session=session)
         df_div_period = dyf.add_period_columns_by_div(df_div)
         df_com = dyf.group_by_period_by_div(df_div_period)
         _, df_stat = dyf.merge_dividend_data(df_close, df_com)
         
         # 데이터의 날짜 범위 확인 (timezone 제거하여 일치시킴)
-        df_price.index = df_price.index.tz_localize(None)
         df_stat['Date'] = pd.to_datetime(df_stat['Date']).dt.tz_localize(None)
         
         return df_price, df_stat, df_div_period, df_com
