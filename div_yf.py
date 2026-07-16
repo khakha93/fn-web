@@ -36,6 +36,11 @@ def group_by_period_by_div(df, sum_frequency=4):
     return df_com.reset_index()
 
 def merge_dividend_data(df_price, df_com):
+    # df_price가 Series일 경우 안전하게 DataFrame으로 변환 (캐시 파일 로드 시 발생 대응)
+    if isinstance(df_price, pd.Series):
+        name = df_price.name if df_price.name else 'Close'
+        df_price = df_price.to_frame(name=name)
+
     ticker = df_price.columns[0]
 
     # 각 배당 주기에 대하여, 시작 날짜의 다음날부터 다음 주기의 시작 날짜까지, adj_div 를 기입
