@@ -1,9 +1,18 @@
 import pandas as pd
 import yfinance as yf
+import requests
 
+def get_yf_session():
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    })
+    return session
 
-def get_yf_dividend_history(ticker):
-    Ticker = yf.Ticker(ticker)
+def get_yf_dividend_history(ticker, session=None):
+    if session is None:
+        session = get_yf_session()
+    Ticker = yf.Ticker(ticker, session=session)
     df_div_period = Ticker.dividends.reset_index()
     df_div_period['Date'] = pd.to_datetime(df_div_period['Date'].dt.date)
     return df_div_period
