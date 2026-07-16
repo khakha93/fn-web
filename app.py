@@ -66,9 +66,10 @@ if st.session_state.menu == "📊 개별 종목 분석":
         ticker_input = st.text_input("티커 입력", value=st.session_state.ticker).strip().upper()
     with col2:
         st.markdown("<div style='padding-top: 28px;'></div>", unsafe_allow_html=True)
-        query_btn = st.button("조회", use_container_width=True)
+        query_btn = st.button("조회", width="stretch")
         
-    if query_btn:
+    # 엔터를 치거나(입력 변경 감지) 조회 버튼을 클릭했을 때 모두 세션 상태 업데이트 및 새로고침
+    if query_btn or (ticker_input != st.session_state.ticker):
         st.session_state.ticker = ticker_input
         st.rerun()
 
@@ -136,7 +137,7 @@ if st.session_state.menu == "📊 개별 종목 분석":
                     min_value=min_date,
                     max_value=max_date
                 )
-            submitted = st.form_submit_button(label="기간 적용 및 조회", use_container_width=True)
+            submitted = st.form_submit_button(label="기간 적용 및 조회", width="stretch")
 
     if submitted:
         if start_input > end_input:
@@ -432,7 +433,7 @@ if st.session_state.menu == "📊 개별 종목 분석":
                 spikesnap="data"
             )
 
-            st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True, 'doubleClick': 'reset'})
+            st.plotly_chart(fig, width="stretch", config={'scrollZoom': True, 'doubleClick': 'reset'})
 
         with tab2:
             st.markdown("### 📜 배당 변동 주기별 상세 내역")
@@ -470,7 +471,7 @@ if st.session_state.menu == "📊 개별 종목 분석":
                 
                 st.dataframe(
                     df_display,
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                     column_config={
                         "시작일": st.column_config.DateColumn("시작일", format="YYYY-MM-DD"),
@@ -499,13 +500,13 @@ if st.session_state.menu == "📊 개별 종목 분석":
     with col_wl:
         st.markdown("##### ⭐ 관심 종목 설정")
         if is_in_wl:
-            if st.button("⭐ 관심 종목에서 해제", use_container_width=True):
+            if st.button("⭐ 관심 종목에서 해제", width="stretch"):
                 sh.remove_from_watchlist(ticker)
                 st.cache_data.clear()
                 st.success("관심 종목에서 해제되었습니다.")
                 st.rerun()
         else:
-            if st.button("⭐ 관심 종목으로 등록", use_container_width=True, type="primary"):
+            if st.button("⭐ 관심 종목으로 등록", width="stretch", type="primary"):
                 sh.add_to_watchlist(ticker)
                 st.cache_data.clear()
                 st.success("관심 종목으로 등록되었습니다.")
@@ -526,11 +527,11 @@ if st.session_state.menu == "📊 개별 종목 분석":
         status_txt = f"현재 보유 중: {p_shares}주 (평단 ${p_price:.2f})" if in_portfolio else "현재 미보유"
         st.caption(status_txt)
         
-        with st.popover("💼 보유 자산 정보 수정", use_container_width=True):
+        with st.popover("💼 보유 자산 정보 수정", width="stretch"):
             with st.form("pf_edit_form", clear_on_submit=False):
                 shares_in = st.number_input("보유 수량 (주)", min_value=0.0, value=p_shares, step=0.1)
                 price_in = st.number_input("평균 매수 단가 ($)", min_value=0.0, value=p_price, step=0.01)
-                pf_submit = st.form_submit_button("저장하기", use_container_width=True)
+                pf_submit = st.form_submit_button("저장하기", width="stretch")
                 if pf_submit:
                     if shares_in > 0:
                         sh.save_portfolio(ticker, shares_in, price_in)
@@ -547,7 +548,7 @@ if st.session_state.menu == "📊 개별 종목 분석":
     st.markdown("##### ✍️ 투자 메모 및 코멘트")
     saved_comment = get_comment_cached(ticker)
     comment_in = st.text_area("이 종목에 대한 분석이나 매수 근거 등의 기록을 남겨보세요.", value=saved_comment, height=120)
-    if st.button("📝 코멘트 저장", use_container_width=True):
+    if st.button("📝 코멘트 저장", width="stretch"):
         sh.save_comment(ticker, comment_in)
         st.cache_data.clear()
         st.success("코멘트가 성공적으로 저장되었습니다.")
@@ -810,7 +811,7 @@ div[data-testid="stVerticalBlock"]:has(span.inspector-marker):not(:has(div[data-
         # st.data_editor로 렌더링 (자체 스크롤바 부여)
         edited_df = st.data_editor(
             display_df[columns_to_show],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             height=320,  # 스크롤 방지를 위해 높이 제한 고정
             column_config={
@@ -883,7 +884,7 @@ div[data-testid="stVerticalBlock"]:has(span.inspector-marker):not(:has(div[data-
                     st.markdown("<div style='padding-top: 5px;'></div>", unsafe_allow_html=True)
                     
                     # 1. 상세 차트 분석 이동
-                    if st.button("📊 상세 차트 분석 이동", use_container_width=True, type="primary"):
+                    if st.button("📊 상세 차트 분석 이동", width="stretch", type="primary"):
                         st.session_state.ticker = sel_ticker
                         st.session_state.menu = "📊 개별 종목 분석"
                         st.cache_data.clear()
@@ -893,13 +894,13 @@ div[data-testid="stVerticalBlock"]:has(span.inspector-marker):not(:has(div[data-
                     watchlist = get_watchlist_cached()
                     is_in_wl = sel_ticker in watchlist
                     if is_in_wl:
-                        if st.button("⭐ 관심 종목 해제", use_container_width=True):
+                        if st.button("⭐ 관심 종목 해제", width="stretch"):
                             sh.remove_from_watchlist(sel_ticker)
                             st.cache_data.clear()
                             st.toast(f"⭐ {sel_ticker} 관심 종목 해제 완료!")
                             st.rerun()
                     else:
-                        if st.button("⭐ 관심 종목 등록", use_container_width=True):
+                        if st.button("⭐ 관심 종목 등록", width="stretch"):
                             sh.add_to_watchlist(sel_ticker)
                             st.cache_data.clear()
                             st.toast(f"⭐ {sel_ticker} 관심 종목 등록 완료!")
@@ -928,7 +929,7 @@ div[data-testid="stVerticalBlock"]:has(span.inspector-marker):not(:has(div[data-
                             shares_in = st.number_input("수량", min_value=0.0, value=p_shares, step=0.1)
                         with col_form2:
                             price_in = st.number_input("평단 ($)", min_value=0.0, value=p_price, step=0.01)
-                        pf_submit = st.form_submit_button("💼 포트폴리오 저장/수정", use_container_width=True)
+                        pf_submit = st.form_submit_button("💼 포트폴리오 저장/수정", width="stretch")
                         if pf_submit:
                             if shares_in > 0:
                                 sh.save_portfolio(sel_ticker, shares_in, price_in)
@@ -972,7 +973,7 @@ div[data-testid="stVerticalBlock"]:has(span.inspector-marker):not(:has(div[data-
             sync_dgro = st.checkbox("DGRO ETF", value=True, help="약 400개 종목, 약 1분 소요")
             st.caption(f"🕒 최근 동기화: {group_times.get('DGRO', '-')}")
             
-        submit_sync = st.form_submit_button("🔄 선택된 그룹 배당 정보 수동 업데이트", use_container_width=True)
+        submit_sync = st.form_submit_button("🔄 선택된 그룹 배당 정보 수동 업데이트", width="stretch")
 
     if submit_sync:
         selected_sync_groups = []
@@ -1105,7 +1106,7 @@ elif st.session_state.menu == "💼 내 자산 & 관심 종목":
             pf_display_df = pd.DataFrame(rows)
             st.dataframe(
                 pf_display_df,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 column_config={
                     "평균 매수가 ($)": st.column_config.NumberColumn("평균 매수가", format="$%.2f"),
@@ -1130,7 +1131,7 @@ elif st.session_state.menu == "💼 내 자산 & 관심 종목":
             with col_del:
                 del_ticker = st.selectbox("포트폴리오에서 삭제할 자산 선택", ["선택 안 함"] + pf_tickers)
                 if del_ticker != "선택 안 함":
-                    if st.button("🗑️ 선택 자산 삭제", use_container_width=True):
+                    if st.button("🗑️ 선택 자산 삭제", width="stretch"):
                         sh.remove_from_portfolio(del_ticker)
                         st.cache_data.clear()
                         st.success(f"{del_ticker} 삭제 성공!")
@@ -1157,7 +1158,7 @@ elif st.session_state.menu == "💼 내 자산 & 관심 종목":
                 
                 st.dataframe(
                     wl_display[['티커', '회사명', '최근 주당 배당금 ($)', '자산 분류', '마지막 동기화']],
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                     column_config={
                         "최근 주당 배당금 ($)": st.column_config.NumberColumn("최근 주당 배당금 ($)", format="$%.4f")
