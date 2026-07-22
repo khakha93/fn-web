@@ -17,6 +17,76 @@ def run_init_sheets():
 
 run_init_sheets()
 
+
+def check_price_alerts():
+    """설정된 조건부 타겟 가격 알림 중, 도달한 것이 있는지 yfinance 최신 주가와 비교하여 toast로 띄웁니다."""
+    if "alerts_checked" not in st.session_state:
+        st.session_state.alerts_checked = {}
+
+    try:
+        alerts_df = sh.get_alerts()
+    except Exception:
+        return
+
+    if alerts_df.empty:
+        return
+
+    active_alerts = alerts_df[alerts_df["is_triggered"] == False]
+    if active_alerts.empty:
+        return
+
+    tickers_to_check = active_alerts["symbol"].unique().tolist()
+
+    try:
+        price_data = yf.download(tickers_to_check, period="1d", interval="1m", progress=False)
+        if price_data.empty:
+            return
+
+        current_prices = {}
+        if len(tickers_to_check) == 1:
+            ticker = tickers_to_check[0]
+            if "Close" in price_data.columns:
+                current_prices[ticker] = float(price_data["Close"].iloc[-1])
+        else:
+            for t in tickers_to_check:
+                try:
+                    if "Close" in price_data.columns and t in price_data["Close"].columns:
+                        current_prices[t] = float(price_data["Close"][t].iloc[-1])
+                except Exception:
+                    pass
+    except Exception:
+        return
+
+    for _, row in active_alerts.iterrows():
+        sym = row["symbol"]
+        target = float(row["target_price"])
+        cond = str(row["condition_type"]).strip()
+        
+        curr_p = current_prices.get(sym, 0.0)
+        if curr_p == 0.0:
+            continue
+
+        alert_key = f"{sym}_{target}_{cond}"
+
+        if st.session_state.alerts_checked.get(alert_key):
+            continue
+
+        triggered = False
+        if cond == "above" and curr_p >= target:
+            triggered = True
+        elif cond == "below" and curr_p <= target:
+            triggered = True
+
+        if triggered:
+            cond_str = "상승 돌파" if cond == "above" else "하락 돌파"
+            st.toast(f"🔔 **[조건부 타겟 도달]** {sym}의 가격이 ${target:.2f}을 {cond_str}했습니다! (현재가: ${curr_p:.2f})", icon="🎯")
+            sh.set_alert_triggered(sym, cond, True)
+            st.session_state.alerts_checked[alert_key] = True
+            st.cache_data.clear()
+
+
+check_price_alerts()
+
 # 구글 시트 읽기 기능 캐싱
 @st.cache_data(ttl=300)
 def get_stocks_cached():
@@ -31,6 +101,18 @@ def get_watchlist_cached():
     return sh.get_watchlist()
 
 @st.cache_data(ttl=60)
+def get_watchlist_details_cached():
+    return sh.get_watchlist_details()
+
+@st.cache_data(ttl=60)
+def get_alerts_cached():
+    return sh.get_alerts()
+
+@st.cache_data(ttl=60)
+def get_trading_history_cached():
+    return sh.get_trading_history()
+
+@st.cache_data(ttl=60)
 def get_comment_cached(ticker):
     return sh.get_comment(ticker)
 
@@ -42,7 +124,7 @@ if "ticker" not in st.session_state:
 
 # 사이드바 네비게이션 구성
 st.sidebar.title("💰 배당 모니터링 시스템")
-menu_options = ["📊 개별 종목 분석", "📋 전체 종목 리스트", "💼 내 자산 & 관심 종목"]
+menu_options = ["📊 개별 종목 분석", "📋 전체 종목 리스트", "💼 내 투자 관리"]
 default_menu_index = menu_options.index(st.session_state.menu) if st.session_state.menu in menu_options else 0
 
 selected_menu = st.sidebar.radio(
@@ -540,56 +622,125 @@ if st.session_state.menu == "📊 개별 종목 분석":
 
     render_chart_section(ticker, df_price, df_stat, df_div_period, df_com, start_date, end_date)
 
-    # --- 개인 기록 관리 섹션 추가 ---
+    # --- 통합 액션 패널 (종목 관리) 추가 ---
+    try:
+        current_price = float(df_price['Close'].iloc[-1])
+        latest_div = float(df_com.iloc[-1]['adj_div']) if not df_com.empty else 0.0
+        current_yield = latest_div / current_price if current_price > 0 else 0.0
+    except Exception:
+        current_price = 0.0
+        current_yield = 0.0
+
     st.divider()
-    st.subheader(f"📝 {ticker} 개인 기록 관리")
+    st.subheader(f"🛠️ {ticker} 통합 액션 패널")
 
-    col_wl, col_pf = st.columns(2)
+    col_wl, col_al, col_pf = st.columns(3)
 
-    # 관심 종목 체크 및 설정
-    watchlist = get_watchlist_cached()
-    is_in_wl = ticker in watchlist
-
+    # 1. 관심 종목 관리
     with col_wl:
         st.markdown("##### ⭐ 관심 종목 설정")
+        wl_details = get_watchlist_details_cached()
+        is_in_wl = ticker in wl_details['symbol'].values
+        current_group = "기본 그룹"
         if is_in_wl:
-            if st.button("⭐ 관심 종목에서 해제", width="stretch"):
-                sh.remove_from_watchlist(ticker)
-                st.cache_data.clear()
-                st.success("관심 종목에서 해제되었습니다.")
-                st.rerun()
+            current_group = wl_details[wl_details['symbol'] == ticker].iloc[0]['group_name']
+            
+        all_groups = sorted(wl_details['group_name'].dropna().unique().tolist()) if not wl_details.empty else []
+        if "기본 그룹" not in all_groups:
+            all_groups.insert(0, "기본 그룹")
+            
+        group_sel = st.selectbox("관심 그룹 선택", all_groups + ["+ 새 그룹 추가..."], index=all_groups.index(current_group) if current_group in all_groups else 0, key="quick_wl_group")
+        
+        if group_sel == "+ 새 그룹 추가...":
+            new_group = st.text_input("새 그룹명 입력", "").strip()
+            group_to_save = new_group
         else:
-            if st.button("⭐ 관심 종목으로 등록", width="stretch", type="primary"):
-                sh.add_to_watchlist(ticker)
+            group_to_save = group_sel
+
+        c_wl_btn1, c_wl_btn2 = st.columns(2)
+        with c_wl_btn1:
+            if st.button("⭐ 등록/수정", width="stretch", key="wl_save_btn", type="primary"):
+                if group_sel == "+ 새 그룹 추가..." and not group_to_save:
+                    st.error("그룹명을 입력해주세요.")
+                else:
+                    sh.add_to_watchlist(ticker, group_to_save)
+                    st.cache_data.clear()
+                    st.success("관심 종목 등록/수정 완료!")
+                    st.rerun()
+        with c_wl_btn2:
+            if is_in_wl:
+                if st.button("🗑️ 관심 해제", width="stretch", key="wl_del_btn"):
+                    sh.remove_from_watchlist(ticker)
+                    st.cache_data.clear()
+                    st.success("관심 해제 완료!")
+                    st.rerun()
+            else:
+                st.button("🗑️ 관심 해제", width="stretch", disabled=True, key="wl_del_btn_dis")
+
+    # 2. 조건부 타겟 관리
+    with col_al:
+        st.markdown("##### 🎯 조건부 타겟 설정")
+        alerts_df = get_alerts_cached()
+        my_alerts = alerts_df[alerts_df['symbol'] == ticker]
+        if not my_alerts.empty:
+            alert_items = []
+            for _, a_row in my_alerts.iterrows():
+                cond_str = "상승 돌파" if a_row['condition_type'] == "above" else "하락 돌파"
+                trig_str = "(도달완료)" if a_row['is_triggered'] else "(대기중)"
+                alert_items.append(f"${a_row['target_price']:.2f} {cond_str} {trig_str}")
+            st.caption("감시 중: " + ", ".join(alert_items))
+        else:
+            st.caption("설정된 타겟 가격이 없습니다.")
+
+        target_p_in = st.number_input("목표 주가 ($)", min_value=0.0, value=current_price, step=0.01, key="quick_al_price")
+        cond_type_in = st.selectbox("조건 설정", ["above", "below"], format_func=lambda x: "📈 상승 돌파 시" if x == "above" else "📉 하락 돌파 시", key="quick_al_cond")
+
+        c_al_btn1, c_al_btn2 = st.columns(2)
+        with c_al_btn1:
+            if st.button("🎯 타겟 등록", width="stretch", key="al_save_btn", type="primary"):
+                sh.save_alert(ticker, target_p_in, cond_type_in)
                 st.cache_data.clear()
-                st.success("관심 종목으로 등록되었습니다.")
+                st.success("조건부 타겟이 저장되었습니다.")
                 st.rerun()
+        with c_al_btn2:
+            if not my_alerts.empty:
+                if st.button("🗑️ 전체 삭제", width="stretch", key="al_del_btn"):
+                    for _, a_row in my_alerts.iterrows():
+                        sh.remove_alert(ticker, a_row['condition_type'])
+                    st.cache_data.clear()
+                    st.success("타겟 조건 삭제 완료!")
+                    st.rerun()
+            else:
+                st.button("🗑️ 전체 삭제", width="stretch", disabled=True, key="al_del_btn_dis")
 
-    # 포트폴리오 정보 불러오기
-    portfolio_df = get_portfolio_cached()
-    in_portfolio = ticker in portfolio_df['symbol'].values
-    p_shares = 0.0
-    p_price = 0.0
-    if in_portfolio:
-        row = portfolio_df[portfolio_df['symbol'] == ticker].iloc[0]
-        p_shares = float(row['shares'])
-        p_price = float(row['purchase_price'])
-
+    # 3. 포트폴리오 관리
     with col_pf:
         st.markdown("##### 💼 포트폴리오 관리")
-        status_txt = f"현재 보유 중: {p_shares}주 (평단 ${p_price:.2f})" if in_portfolio else "현재 미보유"
-        st.caption(status_txt)
-        
+        portfolio_df = get_portfolio_cached()
+        in_portfolio = ticker in portfolio_df['symbol'].values
+        p_shares = 0.0
+        p_price = 0.0
+        p_entry_reason = ""
+        if in_portfolio:
+            p_row = portfolio_df[portfolio_df['symbol'] == ticker].iloc[0]
+            p_shares = float(p_row['shares'])
+            p_price = float(p_row['purchase_price'])
+            p_entry_reason = str(p_row['entry_reason']) if pd.notna(p_row['entry_reason']) else ""
+            st.caption(f"보유 중: {p_shares}주 (평단 ${p_price:.2f})")
+        else:
+            st.caption("현재 미보유 상태입니다.")
+
         with st.popover("💼 보유 자산 정보 수정", width="stretch"):
             with st.form("pf_edit_form", clear_on_submit=False):
                 shares_in = st.number_input("보유 수량 (주)", min_value=0.0, value=p_shares, step=0.1)
                 price_in = st.number_input("평균 매수 단가 ($)", min_value=0.0, value=p_price, step=0.01)
+                reason_in = st.text_area("진입 근거", value=p_entry_reason, height=80)
                 pf_submit = st.form_submit_button("저장하기", width="stretch")
                 if pf_submit:
                     if shares_in > 0:
-                        sh.save_portfolio(ticker, shares_in, price_in)
+                        sh.save_portfolio(ticker, shares_in, price_in, reason_in)
                         st.cache_data.clear()
-                        st.success("포트폴리오가 정상적으로 저장되었습니다.")
+                        st.success("포트폴리오가 정상 저장되었습니다.")
                         st.rerun()
                     else:
                         if in_portfolio:
@@ -601,11 +752,24 @@ if st.session_state.menu == "📊 개별 종목 분석":
     st.markdown("##### ✍️ 투자 메모 및 코멘트")
     saved_comment = get_comment_cached(ticker)
     comment_in = st.text_area("이 종목에 대한 분석이나 매수 근거 등의 기록을 남겨보세요.", value=saved_comment, height=120)
-    if st.button("📝 코멘트 저장", width="stretch"):
-        sh.save_comment(ticker, comment_in)
-        st.cache_data.clear()
-        st.success("코멘트가 성공적으로 저장되었습니다.")
-        st.rerun()
+
+    col_btn1, col_btn2 = st.columns(2)
+    with col_btn1:
+        if st.button("📝 구글 시트에 코멘트 저장", width="stretch"):
+            sh.save_comment(ticker, comment_in)
+            st.cache_data.clear()
+            st.success("코멘트가 성공적으로 구글 시트에 저장되었습니다.")
+            st.rerun()
+            
+    with col_btn2:
+        if st.button("📝 노션에 투자일지 기록", width="stretch", type="primary"):
+            import notion_helper as nh
+            with st.spinner("노션 API 전송 중..."):
+                success = nh.send_journal_to_notion(ticker, current_price, current_yield, comment_in)
+            if success:
+                st.success(f"🎉 {ticker} 투자일지가 노션에 성공적으로 기록되었습니다!")
+            else:
+                st.error("노션 기록에 실패했습니다. secrets.toml의 토큰과 DB ID 설정을 확인해 주세요.")
 
 # 2. 전체 종목 리스트 페이지
 elif st.session_state.menu == "📋 전체 종목 리스트":
@@ -1061,17 +1225,23 @@ div[data-testid="stVerticalBlock"]:has(span.inspector-marker):not(:has(div[data-
                 except Exception as e:
                     st.error(f"동기화 중 오류 발생: {e}")
 
-# 3. 내 자산 & 관심 종목 페이지
-elif st.session_state.menu == "💼 내 자산 & 관심 종목":
-    st.header("💼 내 자산 & 관심 종목")
+# 3. 내 투자 관리 페이지
+elif st.session_state.menu == "💼 내 투자 관리":
+    st.header("💼 내 투자 관리 (My Investment Hub)")
     
-    tab_pf, tab_wl = st.tabs(["💼 내 포트폴리오", "⭐ 관심 종목"])
+    tab_pf, tab_wl, tab_al, tab_th = st.tabs([
+        "💼 내 포트폴리오", 
+        "⭐ 관심 종목 & 그룹", 
+        "🎯 조건부 타겟", 
+        "📝 매매 기록"
+    ])
     
     # 캐시된 종목 마스터 리스트 로딩
     stocks_df = get_stocks_cached()
     
+    # ------------------ Tab 1: 내 포트폴리오 ------------------
     with tab_pf:
-        st.subheader("보유 자산 현황 요약")
+        st.subheader("보유 자산 현황")
         portfolio_df = get_portfolio_cached()
         
         if portfolio_df.empty:
@@ -1104,6 +1274,7 @@ elif st.session_state.menu == "💼 내 자산 & 관심 종목":
                 sym = row['symbol']
                 shares = float(row['shares'])
                 avg_cost = float(row['purchase_price'])
+                entry_reason = row['entry_reason'] if pd.notna(row['entry_reason']) else ""
                 
                 curr_price = close_prices.get(sym, 0.0)
                 if curr_price == 0.0:
