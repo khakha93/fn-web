@@ -1,11 +1,16 @@
+import importlib
 import div_yf as dyf
+importlib.reload(dyf)
+import sheets_helper as sh
+importlib.reload(sh)
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 import warnings
 import plotly.graph_objects as px
 from plotly.subplots import make_subplots
-import sheets_helper as sh
+import os
+import datetime
 
 # Streamlit/yfinance 내부 expire_cache 관련 비동기 RuntimeWarning 무시
 warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*expire_cache.*")
@@ -17,77 +22,7 @@ def run_init_sheets():
 
 run_init_sheets()
 
-
-def check_price_alerts():
-    """설정된 조건부 타겟 가격 알림 중, 도달한 것이 있는지 yfinance 최신 주가와 비교하여 toast로 띄웁니다."""
-    if "alerts_checked" not in st.session_state:
-        st.session_state.alerts_checked = {}
-
-    try:
-        alerts_df = sh.get_alerts()
-    except Exception:
-        return
-
-    if alerts_df.empty:
-        return
-
-    active_alerts = alerts_df[alerts_df["is_triggered"] == False]
-    if active_alerts.empty:
-        return
-
-    tickers_to_check = active_alerts["symbol"].unique().tolist()
-
-    try:
-        price_data = yf.download(tickers_to_check, period="1d", interval="1m", progress=False)
-        if price_data.empty:
-            return
-
-        current_prices = {}
-        if len(tickers_to_check) == 1:
-            ticker = tickers_to_check[0]
-            if "Close" in price_data.columns:
-                current_prices[ticker] = float(price_data["Close"].iloc[-1])
-        else:
-            for t in tickers_to_check:
-                try:
-                    if "Close" in price_data.columns and t in price_data["Close"].columns:
-                        current_prices[t] = float(price_data["Close"][t].iloc[-1])
-                except Exception:
-                    pass
-    except Exception:
-        return
-
-    for _, row in active_alerts.iterrows():
-        sym = row["symbol"]
-        target = float(row["target_price"])
-        cond = str(row["condition_type"]).strip()
-        
-        curr_p = current_prices.get(sym, 0.0)
-        if curr_p == 0.0:
-            continue
-
-        alert_key = f"{sym}_{target}_{cond}"
-
-        if st.session_state.alerts_checked.get(alert_key):
-            continue
-
-        triggered = False
-        if cond == "above" and curr_p >= target:
-            triggered = True
-        elif cond == "below" and curr_p <= target:
-            triggered = True
-
-        if triggered:
-            cond_str = "상승 돌파" if cond == "above" else "하락 돌파"
-            st.toast(f"🔔 **[조건부 타겟 도달]** {sym}의 가격이 ${target:.2f}을 {cond_str}했습니다! (현재가: ${curr_p:.2f})", icon="🎯")
-            sh.set_alert_triggered(sym, cond, True)
-            st.session_state.alerts_checked[alert_key] = True
-            st.cache_data.clear()
-
-
-check_price_alerts()
-
-# 구글 시트 읽기 기능 캐싱
+# --- 1. 구글 시트 읽기 기능 캐싱 및 유틸리티 캐시 정의 ---
 @st.cache_data(ttl=300)
 def get_stocks_cached():
     return sh.get_stocks()
@@ -116,15 +51,191 @@ def get_trading_history_cached():
 def get_comment_cached(ticker):
     return sh.get_comment(ticker)
 
+@st.cache_data(ttl=60)
+def get_comments_list_cached(ticker):
+    return sh.get_comments_list(ticker)
+
+# 야후 파이낸스 실시간 주가 알림용 캐시 (체크 주기 30초)
+@st.cache_data(ttl=30)
+def get_alert_prices_cached(tickers_to_check):
+    if not tickers_to_check:
+        return pd.DataFrame()
+    return yf.download(tickers_to_check, period="1d", interval="1m", progress=False)
+
+@st.cache_data
+def get_stock_data(ticker):
+    # 캐시 폴더 생성
+    os.makedirs("cache", exist_ok=True)
+    price_cache_path = f"cache/{ticker}_price.csv"
+    div_cache_path = f"cache/{ticker}_div.csv"
+
+    session = dyf.get_yf_session()
+
+    # 1. 주가 데이터 (df_price) 처리
+    df_price = None
+    if os.path.exists(price_cache_path):
+        try:
+            df_price = pd.read_csv(price_cache_path, index_col=0, parse_dates=True)
+            if isinstance(df_price.columns, pd.MultiIndex):
+                df_price.columns = df_price.columns.droplevel(1)
+            
+            # 타임존 제거
+            df_price.index = df_price.index.tz_localize(None)
+            
+            # 마지막 캐시 날짜 확인
+            last_cached_date = df_price.index.max()
+            today = datetime.date.today()
+            
+            # 하루 이상 차이가 날 경우, 최근 5일치 데이터를 다운로드하여 병합
+            if (today - last_cached_date.date()).days >= 1:
+                df_recent = yf.download(ticker, period="5d", auto_adjust=False, session=session)
+                if not df_recent.empty:
+                    if isinstance(df_recent.columns, pd.MultiIndex):
+                        df_recent.columns = df_recent.columns.droplevel(1)
+                    df_recent.index = df_recent.index.tz_localize(None)
+                    
+                    df_price = pd.concat([df_price, df_recent])
+                    df_price = df_price[~df_price.index.duplicated(keep='last')].sort_index()
+                    df_price.to_csv(price_cache_path)
+        except Exception:
+            df_price = None
+
+    if df_price is None or df_price.empty:
+        df_price = yf.download(ticker, period="max", auto_adjust=False, session=session)
+        if isinstance(df_price.columns, pd.MultiIndex):
+            df_price.columns = df_price.columns.droplevel(1)
+        df_price.index = df_price.index.tz_localize(None)
+        df_price.to_csv(price_cache_path)
+
+    df_close = df_price['Close'].copy()
+
+    # 2. 배당 데이터 (df_div) 처리
+    df_div = None
+    if os.path.exists(div_cache_path):
+        try:
+            file_mtime = datetime.datetime.fromtimestamp(os.path.getmtime(div_cache_path))
+            # 배당 데이터는 자주 변하지 않으므로 3일간 캐시 유효
+            if datetime.datetime.now() - file_mtime < datetime.timedelta(days=3):
+                df_div = pd.read_csv(div_cache_path, parse_dates=['Date'])
+        except Exception:
+            df_div = None
+
+    if df_div is None or df_div.empty:
+        df_div = dyf.get_yf_dividend_history(ticker, session=session)
+        df_div.to_csv(div_cache_path, index=False)
+
+    # 배당수익률 지표 계산 로직
+    df_div_period = dyf.add_period_columns_by_div(df_div)
+    df_com = dyf.group_by_period_by_div(df_div_period)
+    _, df_stat = dyf.merge_dividend_data(df_close, df_com)
+    
+    # 데이터의 날짜 범위 확인 (timezone 제거하여 일치시킴)
+    df_stat['Date'] = pd.to_datetime(df_stat['Date']).dt.tz_localize(None)
+    
+    return df_price, df_stat, df_div_period, df_com
+
+
+# --- 2. 알림 조건 검사 및 알림 표출 기능 ---
+def check_price_alerts():
+    """설정된 조건부 타겟 가격 알림 중, 도달한 것이 있는지 yfinance 최신 주가와 비교하여 toast로 띄웁니다."""
+    if "alerts_checked" not in st.session_state:
+        st.session_state.alerts_checked = {}
+
+    try:
+        alerts_df = get_alerts_cached()
+    except Exception:
+        return
+
+    if alerts_df.empty:
+        return
+
+    active_alerts = alerts_df[alerts_df["is_triggered"] == False]
+    if active_alerts.empty:
+        return
+
+    tickers_to_check = active_alerts["symbol"].unique().tolist()
+
+    try:
+        # 캐시된 야후 파이낸스 다운로더 사용 (30초 TTL)
+        price_data = get_alert_prices_cached(tickers_to_check)
+        if price_data.empty:
+            return
+
+        current_prices = {}
+        if len(tickers_to_check) == 1:
+            ticker = tickers_to_check[0]
+            if "Close" in price_data.columns:
+                current_prices[ticker] = float(price_data["Close"].squeeze().iloc[-1])
+        else:
+            for t in tickers_to_check:
+                try:
+                    if "Close" in price_data.columns and t in price_data["Close"].columns:
+                        current_prices[t] = float(price_data["Close"][t].iloc[-1])
+                except Exception:
+                    pass
+    except Exception:
+        return
+
+    for _, row in active_alerts.iterrows():
+        sym = row["symbol"]
+        target = float(row["target_price"])
+        cond = str(row["condition_type"]).strip()
+        
+        curr_p = current_prices.get(sym, 0.0)
+        if curr_p == 0.0:
+            continue
+
+        alert_key = f"{sym}_{target}_{cond}"
+
+        if st.session_state.alerts_checked.get(alert_key):
+            continue
+
+        # 연산자 파싱을 통한 조건부 타겟 도달 여부 판별
+        triggered = False
+        if cond == "above" or cond == ">=":
+            triggered = (curr_p >= target)
+        elif cond == ">":
+            triggered = (curr_p > target)
+        elif cond == "below" or cond == "<=":
+            triggered = (curr_p <= target)
+        elif cond == "<":
+            triggered = (curr_p < target)
+        elif cond == "==":
+            triggered = (abs(curr_p - target) < 0.001)
+
+        if triggered:
+            if cond in [">=", "above"]:
+                cond_str = "상승 돌파 (>=)"
+            elif cond == ">":
+                cond_str = "상승 돌파 (>)"
+            elif cond in ["<=", "below"]:
+                cond_str = "하락 돌파 (<=)"
+            elif cond == "<":
+                cond_str = "하락 돌파 (<)"
+            elif cond == "==":
+                cond_str = "가격 일치 (==)"
+            else:
+                cond_str = cond
+
+            st.toast(f"🔔 **[조건부 타겟 도달]** {sym}의 가격이 ${target:.2f}을 {cond_str}했습니다! (현재가: ${curr_p:.2f})", icon="🎯")
+            sh.set_alert_triggered(sym, cond, True)
+            st.session_state.alerts_checked[alert_key] = True
+            st.cache_data.clear()
+
+
+check_price_alerts()
+
+
+# --- 3. 세션 상태 및 사이드바 내비게이션 구성 ---
 # Session State를 이용한 메뉴 및 기본 티커 상태 초기화
 if "menu" not in st.session_state:
-    st.session_state.menu = "📊 개별 종목 분석"
+    st.session_state.menu = "💼 내 투자 관리"
 if "ticker" not in st.session_state:
-    st.session_state.ticker = ""  # 기본값으로 코카콜라(KO) 설정
+    st.session_state.ticker = ""
 
 # 사이드바 네비게이션 구성
-st.sidebar.title("💰 배당 모니터링 시스템")
-menu_options = ["📊 개별 종목 분석", "📋 전체 종목 리스트", "💼 내 투자 관리"]
+st.sidebar.title("💰 메뉴 내비게이션")
+menu_options = ["💼 내 투자 관리", "📋 전체 종목 리스트", "📊 개별 종목 분석"]
 default_menu_index = menu_options.index(st.session_state.menu) if st.session_state.menu in menu_options else 0
 
 selected_menu = st.sidebar.radio(
@@ -138,103 +249,104 @@ if selected_menu != st.session_state.menu:
     st.session_state.menu = selected_menu
     st.rerun()
 
+# --- 메인 상단 공통 헤더 및 신속 조회 검색 바 ---
+# 실시간 대문자 변환 및 데스크탑 풀와이드 스틱키 헤더 CSS 주입
+st.markdown("""
+<style>
+/* Streamlit 기본 헤더 바를 투명하게 만들어 관리 도구(우측 상단 툴바) 및 토글 버튼들이 정상적으로 작동하도록 함 */
+header[data-testid="stHeader"] {
+    background-color: transparent !important;
+}
+
+/* 사이드바 접힘 상태의 열기 버튼 컨테이너(collapsedSidebarCodegen)가 풀와이드 헤더 위에 둥둥 떠서 항상 노출되도록 보정 */
+[data-testid="collapsedSidebarCodegen"] {
+    z-index: 999999 !important;
+}
+[data-testid="stSidebarCollapseButton"] {
+    z-index: 999999 !important;
+}
+[data-testid="stSidebarCollapseButton"] button {
+    color: #38bdf8 !important; /* 사이언 네온 단추 색상 적용 */
+}
+
+div[data-testid="stTextInput"] input {
+    text-transform: uppercase !important;
+}
+
+/* 탑 네비게이션 바 스타일링 (st.container key="top_header_container" 연동) */
+div.st-key-top_header_container {
+    position: sticky !important;
+    top: -6rem !important;
+    background: linear-gradient(90deg, #0f172a 0%, #1e293b 100%) !important;
+    border-bottom: 2px solid #38bdf8 !important; /* 사이언 네온 아웃라인 하단 배치 */
+    border-radius: 0px !important;
+    z-index: 99 !important; /* 사이드바 아래 레이어에 둠 */
+    box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.4) !important;
+    width: auto !important;
+    
+    /* 기본 모바일/패드 반응형 여백 초기화 */
+    margin-left: -1rem !important;
+    margin-right: -1rem !important;
+    margin-top: -6rem !important;
+    padding: 1.2rem 1.5rem !important;
+}
+
+/* 데스크탑 화면 패딩 오프셋 보정 (Streamlit 기본 block-container 패딩 상쇄) */
+@media (min-width: 768px) {
+    div.st-key-top_header_container {
+        margin-left: -5rem !important;
+        margin-right: -5rem !important;
+        margin-top: -6rem !important;
+        padding-left: 5rem !important;
+        padding-right: 5rem !important;
+    }
+}
+
+div.st-key-top_header_container h2 {
+    color: #38bdf8 !important; /* 타이틀 사이언 블루 강조 */
+    font-weight: 800 !important;
+    margin: 0 !important;
+    line-height: 40px !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+def make_hdr_ticker_uppercase():
+    if "hdr_ticker_input" in st.session_state:
+        st.session_state.hdr_ticker_input = st.session_state.hdr_ticker_input.strip().upper()
+
+with st.container(border=True, key="top_header_container"):
+    col_hdr_title, col_hdr_search = st.columns([5, 3])
+    with col_hdr_title:
+        st.markdown("<h2 style='margin:0; padding:0; line-height: 40px;'>💰 배당 모니터링 시스템</h2>", unsafe_allow_html=True)
+    with col_hdr_search:
+        col_inp, col_btn = st.columns([3, 1])
+        with col_inp:
+            hdr_ticker_input = st.text_input(
+                "🔍 종목 신속 조회 (티커 입력)", 
+                value=st.session_state.ticker, 
+                label_visibility="collapsed", 
+                key="hdr_ticker_input",
+                on_change=make_hdr_ticker_uppercase
+            ).strip().upper()
+        with col_btn:
+            hdr_query_btn = st.button("조회", use_container_width=True, key="hdr_query_btn")
+
+if hdr_query_btn or (hdr_ticker_input and hdr_ticker_input != st.session_state.ticker):
+    st.session_state.ticker = hdr_ticker_input
+    st.session_state.menu = "📊 개별 종목 분석"
+    st.cache_data.clear()
+    st.rerun()
+
+st.divider()
+
 # 1. 개별 종목 분석 페이지
 if st.session_state.menu == "📊 개별 종목 분석":
-    st.markdown("<style>input { text-transform: uppercase; }</style>", unsafe_allow_html=True)
-    
-    col1, col2 = st.columns([5, 1])
-    with col1:
-        # 입력창에 session_state.ticker 자동 연계
-        ticker_input = st.text_input("티커 입력", value=st.session_state.ticker).strip().upper()
-    with col2:
-        st.markdown("<div style='padding-top: 28px;'></div>", unsafe_allow_html=True)
-        query_btn = st.button("조회", width="stretch")
-        
-    # 엔터를 치거나(입력 변경 감지) 조회 버튼을 클릭했을 때 모두 세션 상태 업데이트 및 새로고침
-    if query_btn or (ticker_input != st.session_state.ticker):
-        st.session_state.ticker = ticker_input
-        st.rerun()
-
     ticker = st.session_state.ticker
 
     if not ticker:
-        st.info("차트를 조회하려면 티커를 입력해주세요. (예: QCOM, KO, PG)")
+        st.info("사이드바의 '🔍 종목 신속 조회' 입력창에 분석할 티커를 입력해 주세요. (예: QCOM, KO, PG)")
         st.stop()
-
-    @st.cache_data
-    def get_stock_data(ticker):
-        import os
-        import datetime
-
-        # 캐시 폴더 생성
-        os.makedirs("cache", exist_ok=True)
-        price_cache_path = f"cache/{ticker}_price.csv"
-        div_cache_path = f"cache/{ticker}_div.csv"
-
-        session = dyf.get_yf_session()
-
-        # 1. 주가 데이터 (df_price) 처리
-        df_price = None
-        if os.path.exists(price_cache_path):
-            try:
-                df_price = pd.read_csv(price_cache_path, index_col=0, parse_dates=True)
-                if isinstance(df_price.columns, pd.MultiIndex):
-                    df_price.columns = df_price.columns.droplevel(1)
-                
-                # 타임존 제거
-                df_price.index = df_price.index.tz_localize(None)
-                
-                # 마지막 캐시 날짜 확인
-                last_cached_date = df_price.index.max()
-                today = datetime.datetime.now().date()
-                
-                # 하루 이상 차이가 날 경우, 최근 5일치 데이터를 다운로드하여 병합
-                if (today - last_cached_date.date()).days >= 1:
-                    df_recent = yf.download(ticker, period="5d", auto_adjust=False, session=session)
-                    if not df_recent.empty:
-                        if isinstance(df_recent.columns, pd.MultiIndex):
-                            df_recent.columns = df_recent.columns.droplevel(1)
-                        df_recent.index = df_recent.index.tz_localize(None)
-                        
-                        df_price = pd.concat([df_price, df_recent])
-                        df_price = df_price[~df_price.index.duplicated(keep='last')].sort_index()
-                        df_price.to_csv(price_cache_path)
-            except Exception:
-                df_price = None
-
-        if df_price is None or df_price.empty:
-            df_price = yf.download(ticker, period="max", auto_adjust=False, session=session)
-            if isinstance(df_price.columns, pd.MultiIndex):
-                df_price.columns = df_price.columns.droplevel(1)
-            df_price.index = df_price.index.tz_localize(None)
-            df_price.to_csv(price_cache_path)
-
-        df_close = df_price['Close'].copy()
-
-        # 2. 배당 데이터 (df_div) 처리
-        df_div = None
-        if os.path.exists(div_cache_path):
-            try:
-                file_mtime = datetime.datetime.fromtimestamp(os.path.getmtime(div_cache_path))
-                # 배당 데이터는 자주 변하지 않으므로 3일간 캐시 유효
-                if datetime.datetime.now() - file_mtime < datetime.timedelta(days=3):
-                    df_div = pd.read_csv(div_cache_path, parse_dates=['Date'])
-            except Exception:
-                df_div = None
-
-        if df_div is None or df_div.empty:
-            df_div = dyf.get_yf_dividend_history(ticker, session=session)
-            df_div.to_csv(div_cache_path, index=False)
-
-        # 배당수익률 지표 계산 로직
-        df_div_period = dyf.add_period_columns_by_div(df_div)
-        df_com = dyf.group_by_period_by_div(df_div_period)
-        _, df_stat = dyf.merge_dividend_data(df_close, df_com)
-        
-        # 데이터의 날짜 범위 확인 (timezone 제거하여 일치시킴)
-        df_stat['Date'] = pd.to_datetime(df_stat['Date']).dt.tz_localize(None)
-        
-        return df_price, df_stat, df_div_period, df_com
 
     with st.spinner("데이터 로딩 및 차트 작성 중..."):
         try:
@@ -249,9 +361,15 @@ if st.session_state.menu == "📊 개별 종목 분석":
     # 기본 조회 범위를 2010년 1월 1일로 설정
     default_start = max(min_date, pd.to_datetime("2010-01-01").date())
 
-    if "start_date" not in st.session_state:
+    # 세션 상태가 현재 티커의 날짜 경계를 벗어나지 않도록 보정 (티커 변경 시 날짜 범위 오류 예방)
+    if "start_date" in st.session_state:
+        st.session_state.start_date = max(min_date, min(st.session_state.start_date, max_date))
+    else:
         st.session_state.start_date = default_start
-    if "end_date" not in st.session_state:
+
+    if "end_date" in st.session_state:
+        st.session_state.end_date = max(min_date, min(st.session_state.end_date, max_date))
+    else:
         st.session_state.end_date = max_date
 
     # 상세 기간 설정용 expander 추가 (모바일 화면 최적화)
@@ -620,9 +738,7 @@ if st.session_state.menu == "📊 개별 종목 분석":
             else:
                 st.info("선택한 기간 동안의 배당 변동 데이터가 없습니다.")
 
-    render_chart_section(ticker, df_price, df_stat, df_div_period, df_com, start_date, end_date)
-
-    # --- 통합 액션 패널 (종목 관리) 추가 ---
+    # --- 1단계: 기본 종목 정보 지표 계산 ---
     try:
         current_price = float(df_price['Close'].iloc[-1])
         latest_div = float(df_com.iloc[-1]['adj_div']) if not df_com.empty else 0.0
@@ -631,53 +747,70 @@ if st.session_state.menu == "📊 개별 종목 분석":
         current_price = 0.0
         current_yield = 0.0
 
+    # 현재가와 배당수익률 정보를 타이틀 아래에 메트릭으로 노출
+    m1, m2 = st.columns(2)
+    m1.metric("현재 주가", f"${current_price:,.2f}")
+    m2.metric("예상 연간 배당수익률", f"{current_yield * 100:.2f}%")
+
     st.divider()
     st.subheader(f"🛠️ {ticker} 통합 액션 패널")
 
     col_wl, col_al, col_pf = st.columns(3)
 
-    # 1. 관심 종목 관리
+    # 1. 관심 종목 관리 (다중 그룹 소속 지원)
     with col_wl:
         st.markdown("##### ⭐ 관심 종목 설정")
         wl_details = get_watchlist_details_cached()
-        is_in_wl = ticker in wl_details['symbol'].values
-        current_group = "기본 그룹"
-        if is_in_wl:
-            current_group = wl_details[wl_details['symbol'] == ticker].iloc[0]['group_name']
+        
+        # 현재 종목이 속한 모든 관심 그룹 조회
+        my_groups = wl_details[wl_details['symbol'] == ticker]['group_name'].tolist() if not wl_details.empty else []
+        
+        if my_groups:
+            st.markdown(f"**현재 소속 그룹**: " + ", ".join([f"`{g}`" for g in my_groups]))
+        else:
+            st.caption("현재 관심 종목에 등록되어 있지 않습니다.")
             
         all_groups = sorted(wl_details['group_name'].dropna().unique().tolist()) if not wl_details.empty else []
         if "기본 그룹" not in all_groups:
             all_groups.insert(0, "기본 그룹")
             
-        group_sel = st.selectbox("관심 그룹 선택", all_groups + ["+ 새 그룹 추가..."], index=all_groups.index(current_group) if current_group in all_groups else 0, key="quick_wl_group")
+        group_sel = st.selectbox("추가할 관심 그룹 선택", all_groups + ["+ 새 그룹 추가..."], key="quick_wl_group")
         
         if group_sel == "+ 새 그룹 추가...":
-            new_group = st.text_input("새 그룹명 입력", "").strip()
+            new_group = st.text_input("새 그룹명 입력", "", key="quick_wl_new_group").strip()
             group_to_save = new_group
         else:
             group_to_save = group_sel
 
         c_wl_btn1, c_wl_btn2 = st.columns(2)
         with c_wl_btn1:
-            if st.button("⭐ 등록/수정", width="stretch", key="wl_save_btn", type="primary"):
+            if st.button("⭐ 관심 그룹 추가", width="stretch", key="wl_save_btn", type="primary"):
                 if group_sel == "+ 새 그룹 추가..." and not group_to_save:
                     st.error("그룹명을 입력해주세요.")
+                elif group_to_save in my_groups:
+                    st.warning("⚠️ 이미 해당 관심 그룹에 속해 있습니다.")
                 else:
                     sh.add_to_watchlist(ticker, group_to_save)
+                    if "quick_wl_group" in st.session_state:
+                        del st.session_state["quick_wl_group"]
+                    if "quick_wl_new_group" in st.session_state:
+                        del st.session_state["quick_wl_new_group"]
                     st.cache_data.clear()
-                    st.success("관심 종목 등록/수정 완료!")
+                    st.success(f"관심 그룹 '{group_to_save}'에 추가되었습니다!")
                     st.rerun()
         with c_wl_btn2:
-            if is_in_wl:
-                if st.button("🗑️ 관심 해제", width="stretch", key="wl_del_btn"):
-                    sh.remove_from_watchlist(ticker)
+            if my_groups:
+                # 삭제할 소속 그룹 선택
+                del_group_sel = st.selectbox("제거할 그룹 선택", my_groups, key="quick_wl_del_group")
+                if st.button("🗑️ 그룹에서 해제", width="stretch", key="wl_del_btn"):
+                    sh.remove_from_watchlist(ticker, del_group_sel)
                     st.cache_data.clear()
-                    st.success("관심 해제 완료!")
+                    st.success(f"'{del_group_sel}' 그룹에서 해제 완료!")
                     st.rerun()
             else:
-                st.button("🗑️ 관심 해제", width="stretch", disabled=True, key="wl_del_btn_dis")
+                st.button("🗑️ 그룹에서 해제", width="stretch", disabled=True, key="wl_del_btn_dis")
 
-    # 2. 조건부 타겟 관리
+    # 2. 조건부 타겟 관리 (비교 연산자 직접 입력 복구)
     with col_al:
         st.markdown("##### 🎯 조건부 타겟 설정")
         alerts_df = get_alerts_cached()
@@ -685,22 +818,42 @@ if st.session_state.menu == "📊 개별 종목 분석":
         if not my_alerts.empty:
             alert_items = []
             for _, a_row in my_alerts.iterrows():
-                cond_str = "상승 돌파" if a_row['condition_type'] == "above" else "하락 돌파"
+                op = a_row['condition_type']
+                if op == "above":
+                    cond_str = "상승 돌파 (above)"
+                elif op == "below":
+                    cond_str = "하락 돌파 (below)"
+                else:
+                    cond_str = op
                 trig_str = "(도달완료)" if a_row['is_triggered'] else "(대기중)"
                 alert_items.append(f"${a_row['target_price']:.2f} {cond_str} {trig_str}")
             st.caption("감시 중: " + ", ".join(alert_items))
         else:
             st.caption("설정된 타겟 가격이 없습니다.")
 
-        target_p_in = st.number_input("목표 주가 ($)", min_value=0.0, value=current_price, step=0.01, key="quick_al_price")
-        cond_type_in = st.selectbox("조건 설정", ["above", "below"], format_func=lambda x: "📈 상승 돌파 시" if x == "above" else "📉 하락 돌파 시", key="quick_al_cond")
+        cond_input = st.text_input("조건식 입력 (예: >= 150 또는 <= 50)", value=f">= {current_price:.2f}", key="quick_al_cond_text")
 
         c_al_btn1, c_al_btn2 = st.columns(2)
         with c_al_btn1:
             if st.button("🎯 타겟 등록", width="stretch", key="al_save_btn", type="primary"):
-                sh.save_alert(ticker, target_p_in, cond_type_in)
+                import re
+                cond_input = cond_input.strip()
+                match = re.match(r"^([><]=?|==)\s*([0-9.]+)", cond_input)
+                if match:
+                    operator = match.group(1)
+                    target_val = float(match.group(2))
+                else:
+                    try:
+                        target_val = float(cond_input)
+                        operator = ">=" if target_val >= current_price else "<="
+                    except ValueError:
+                        st.error("올바른 형식의 조건식을 입력해 주세요. (예: >= 150)")
+                        st.stop()
+                sh.save_alert(ticker, target_val, operator)
+                if "quick_al_cond_text" in st.session_state:
+                    del st.session_state["quick_al_cond_text"]
                 st.cache_data.clear()
-                st.success("조건부 타겟이 저장되었습니다.")
+                st.success(f"타겟({operator} {target_val}) 저장 완료!")
                 st.rerun()
         with c_al_btn2:
             if not my_alerts.empty:
@@ -713,7 +866,7 @@ if st.session_state.menu == "📊 개별 종목 분석":
             else:
                 st.button("🗑️ 전체 삭제", width="stretch", disabled=True, key="al_del_btn_dis")
 
-    # 3. 포트폴리오 관리
+    # 3. 포트폴리오 관리 (정수 단위 step=1.0 및 추가매수/청산 분할 지원)
     with col_pf:
         st.markdown("##### 💼 포트폴리오 관리")
         portfolio_df = get_portfolio_cached()
@@ -721,48 +874,146 @@ if st.session_state.menu == "📊 개별 종목 분석":
         p_shares = 0.0
         p_price = 0.0
         p_entry_reason = ""
+        p_pos_type = "LONG"
         if in_portfolio:
             p_row = portfolio_df[portfolio_df['symbol'] == ticker].iloc[0]
             p_shares = float(p_row['shares'])
             p_price = float(p_row['purchase_price'])
             p_entry_reason = str(p_row['entry_reason']) if pd.notna(p_row['entry_reason']) else ""
-            st.caption(f"보유 중: {p_shares}주 (평단 ${p_price:.2f})")
+            p_pos_type = str(p_row.get('position_type', 'LONG')).upper()
+            st.caption(f"보유 중: {p_shares}주 (평단 ${p_price:.2f}, {p_pos_type})")
         else:
             st.caption("현재 미보유 상태입니다.")
 
-        with st.popover("💼 보유 자산 정보 수정", width="stretch"):
-            with st.form("pf_edit_form", clear_on_submit=False):
-                shares_in = st.number_input("보유 수량 (주)", min_value=0.0, value=p_shares, step=0.1)
-                price_in = st.number_input("평균 매수 단가 ($)", min_value=0.0, value=p_price, step=0.01)
-                reason_in = st.text_area("진입 근거", value=p_entry_reason, height=80)
-                pf_submit = st.form_submit_button("저장하기", width="stretch")
-                if pf_submit:
-                    if shares_in > 0:
-                        sh.save_portfolio(ticker, shares_in, price_in, reason_in)
-                        st.cache_data.clear()
-                        st.success("포트폴리오가 정상 저장되었습니다.")
-                        st.rerun()
-                    else:
-                        if in_portfolio:
-                            sh.remove_from_portfolio(ticker)
+        with st.popover("💼 보유 자산 정보 수정 / 청산", width="stretch"):
+            tab_buy, tab_sell = st.tabs(["➕ 포지션 추가/수정", "🗑️ 포지션 청산 (매도)"])
+            
+            with tab_buy:
+                with st.form("pf_edit_form", clear_on_submit=False):
+                    pos_in = st.selectbox("포지션 구분", ["LONG", "SHORT"], index=0 if p_pos_type == "LONG" else 1, key="quick_pf_pos")
+                    shares_in = st.number_input("보유 수량 (주)", min_value=0.0, value=p_shares, step=1.0, key="quick_pf_shares")
+                    price_in = st.number_input("평균 매수 단가 ($)", min_value=0.0, value=p_price if p_price > 0 else current_price, step=0.01, key="quick_pf_price")
+                    reason_in = st.text_area("진입 근거", value=p_entry_reason, height=80, key="quick_pf_reason")
+                    pf_submit = st.form_submit_button("포지션 저장", width="stretch")
+                    if pf_submit:
+                        if shares_in > 0:
+                            sh.save_portfolio(ticker, shares_in, price_in, reason_in, pos_in)
                             st.cache_data.clear()
-                            st.success("포트폴리오에서 삭제되었습니다.")
+                            st.success("포트폴리오 정보가 정상 등록/수정되었습니다.")
                             st.rerun()
+                        else:
+                            if in_portfolio:
+                                sh.remove_from_portfolio(ticker)
+                                st.cache_data.clear()
+                                st.success("포트폴리오에서 삭제되었습니다.")
+                                st.rerun()
+                                
+            with tab_sell:
+                if in_portfolio:
+                    with st.form("pf_liq_form", clear_on_submit=False):
+                        sell_shares = st.number_input("청산할 수량 (주)", min_value=0.0, max_value=p_shares, value=p_shares, step=1.0, key="quick_pf_sell_shares")
+                        sell_price = st.number_input("매도 청산 단가 ($)", min_value=0.0, value=current_price, step=0.01, key="quick_pf_sell_price")
+                        exit_reason = st.text_area("청산 사유", value="", height=80, key="quick_pf_exit_reason")
+                        liq_submit = st.form_submit_button("청산 실행 (매도 완료)", width="stretch")
+                        if liq_submit:
+                            if sell_shares > 0:
+                                sh.liquidate_portfolio(ticker, sell_shares, sell_price, exit_reason)
+                                st.cache_data.clear()
+                                st.success(f"{ticker} 포지션 {sell_shares}주 청산 완료!")
+                                st.rerun()
+                else:
+                    st.info("현재 보유 중인 포지션이 없어 청산할 수 없습니다.")
+
+    if "active_edit_row" not in st.session_state:
+        st.session_state.active_edit_row = None
 
     st.markdown("##### ✍️ 투자 메모 및 코멘트")
-    saved_comment = get_comment_cached(ticker)
-    comment_in = st.text_area("이 종목에 대한 분석이나 매수 근거 등의 기록을 남겨보세요.", value=saved_comment, height=120)
+    comments_history = get_comments_list_cached(ticker)
+    if comments_history:
+        with st.expander(f"💬 {ticker} 코멘트 히스토리 ({len(comments_history)}건)", expanded=True):
+            for i, c in enumerate(comments_history):
+                row_num = c['row_num']
+                is_editing = (st.session_state.active_edit_row == row_num)
+
+                # 작성일 및 수정일 정보를 포함하여 배치
+                h_col1, h_col2 = st.columns([5, 2])
+                with h_col1:
+                    created_val = c.get('created_at', '')
+                    updated_val = c.get('updated_at', '')
+                    if created_val == updated_val or not updated_val:
+                        st.markdown(f"🗓️ **{created_val}**")
+                    else:
+                        st.markdown(f"🗓️ **{created_val}** *(수정됨: {updated_val})*")
+                with h_col2:
+                    btn_col1, btn_col2 = st.columns(2)
+                    if is_editing:
+                        with btn_col1:
+                            if st.button("💾 완료", key=f"done_btn_{row_num}", use_container_width=True):
+                                new_val = st.session_state.get(f"edit_cmt_txt_{row_num}", "").strip()
+                                if new_val:
+                                    sh.update_comment_by_row(row_num, new_val)
+                                    st.session_state.active_edit_row = None
+                                    st.cache_data.clear()
+                                    st.success("코멘트가 성공적으로 수정되었습니다.")
+                                    st.rerun()
+                                else:
+                                    st.warning("코멘트 내용을 입력해주세요.")
+                        with btn_col2:
+                            if st.button("❌ 취소", key=f"cancel_btn_{row_num}", use_container_width=True):
+                                st.session_state.active_edit_row = None
+                                st.rerun()
+                    else:
+                        with btn_col1:
+                            if st.button("✏️ 수정", key=f"edit_btn_{row_num}", use_container_width=True):
+                                st.session_state.active_edit_row = row_num
+                                st.rerun()
+                        with btn_col2:
+                            if st.button("🗑️ 삭제", key=f"del_btn_{row_num}", use_container_width=True):
+                                sh.delete_comment_by_row(row_num)
+                                st.cache_data.clear()
+                                st.success("코멘트가 성공적으로 삭제되었습니다.")
+                                st.rerun()
+                
+                # 코멘트 본문 영역 (편집 여부에 따라 분기)
+                if is_editing:
+                    st.text_area(
+                        "코멘트 수정 입력창",
+                        value=c['content'],
+                        height=100,
+                        key=f"edit_cmt_txt_{row_num}",
+                        label_visibility="collapsed"
+                    )
+                else:
+                    st.write(c['content'])
+                
+                if i < len(comments_history) - 1:
+                    st.divider()
+    else:
+        st.caption("아직 기록된 코멘트가 없습니다. 아래에 새 코멘트를 추가해 보세요.")
+    
+    # 기본값을 비워두어 새로운 코멘트 작성을 용이하게 하고, 세션 키를 지정하여 등록 완료 시 초기화가 가능하도록 함
+    comment_in = st.text_area(
+        "이 종목에 대한 분석이나 매수 근거 등의 기록을 남겨보세요.", 
+        value="", 
+        height=120, 
+        key="quick_comment_input"
+    )
 
     col_btn1, col_btn2 = st.columns(2)
     with col_btn1:
-        if st.button("📝 구글 시트에 코멘트 저장", width="stretch"):
-            sh.save_comment(ticker, comment_in)
-            st.cache_data.clear()
-            st.success("코멘트가 성공적으로 구글 시트에 저장되었습니다.")
-            st.rerun()
+        if st.button("➕ 구글 시트에 새 코멘트 추가 저장", width="stretch", type="primary"):
+            if not comment_in.strip():
+                st.warning("추가할 코멘트 내용을 입력해주세요.")
+            else:
+                sh.save_comment(ticker, comment_in)
+                if "quick_comment_input" in st.session_state:
+                    del st.session_state["quick_comment_input"]
+                st.cache_data.clear()
+                st.success("새 코멘트가 성공적으로 구글 시트에 추가 저장되었습니다.")
+                st.rerun()
             
     with col_btn2:
-        if st.button("📝 노션에 투자일지 기록", width="stretch", type="primary"):
+        if st.button("📝 노션에 투자일지 기록", width="stretch"):
             import notion_helper as nh
             with st.spinner("노션 API 전송 중..."):
                 success = nh.send_journal_to_notion(ticker, current_price, current_yield, comment_in)
@@ -770,6 +1021,10 @@ if st.session_state.menu == "📊 개별 종목 분석":
                 st.success(f"🎉 {ticker} 투자일지가 노션에 성공적으로 기록되었습니다!")
             else:
                 st.error("노션 기록에 실패했습니다. secrets.toml의 토큰과 DB ID 설정을 확인해 주세요.")
+
+    # --- 2단계: 메인 차트 및 배당 변동 주기 상세 내역 (최하단 배치) ---
+    st.divider()
+    render_chart_section(ticker, df_price, df_stat, df_div_period, df_com, start_date, end_date)
 
 # 2. 전체 종목 리스트 페이지
 elif st.session_state.menu == "📋 전체 종목 리스트":
@@ -1245,7 +1500,7 @@ elif st.session_state.menu == "💼 내 투자 관리":
         portfolio_df = get_portfolio_cached()
         
         if portfolio_df.empty:
-            st.info("포트폴리오가 현재 비어 있습니다. '📊 개별 종목 분석' 페이지에서 자산을 추가해 주세요.")
+            st.info("포트폴리오가 현재 비어 있습니다. 사이드바 검색창이나 관심 종목 탭에서 자산을 추가해 주세요.")
         else:
             pf_tickers = portfolio_df['symbol'].tolist()
             close_prices = {}
@@ -1254,7 +1509,7 @@ elif st.session_state.menu == "💼 내 투자 관리":
                 try:
                     price_data = yf.download(pf_tickers, period="5d", interval="1d")
                     if len(pf_tickers) == 1:
-                        close_prices[pf_tickers[0]] = float(price_data['Close'].iloc[-1])
+                        close_prices[pf_tickers[0]] = float(price_data['Close'].squeeze().iloc[-1])
                     else:
                         for t in pf_tickers:
                             try:
@@ -1275,6 +1530,7 @@ elif st.session_state.menu == "💼 내 투자 관리":
                 shares = float(row['shares'])
                 avg_cost = float(row['purchase_price'])
                 entry_reason = row['entry_reason'] if pd.notna(row['entry_reason']) else ""
+                pos_type = str(row.get('position_type', 'LONG')).upper()
                 
                 curr_price = close_prices.get(sym, 0.0)
                 if curr_price == 0.0:
@@ -1288,18 +1544,26 @@ elif st.session_state.menu == "💼 내 투자 관리":
                 annual_div_per_share = last_div * 4
                 
                 cost = shares * avg_cost
-                val = shares * curr_price
-                annual_div = shares * annual_div_per_share
+                
+                # 포지션(LONG/SHORT)에 따른 평가금액 및 손익 계산
+                if pos_type == "SHORT":
+                    gain_loss = shares * (avg_cost - curr_price)
+                    val = cost + gain_loss
+                    annual_div = -shares * annual_div_per_share # 숏 포지션은 배당을 지불해야 함
+                else:
+                    gain_loss = shares * (curr_price - avg_cost)
+                    val = shares * curr_price
+                    annual_div = shares * annual_div_per_share
                 
                 total_invested += cost
                 total_current_val += val
                 total_annual_div += annual_div
                 
-                gain_loss = val - cost
                 gain_loss_pct = (gain_loss / cost * 100) if cost > 0 else 0.0
                 
                 rows.append({
                     '티커': sym,
+                    '포지션': pos_type,
                     '종목명': name,
                     '보유 수량': shares,
                     '평균 매수가 ($)': avg_cost,
@@ -1322,13 +1586,13 @@ elif st.session_state.menu == "💼 내 투자 관리":
             m3.metric("예상 세전 연배당금", f"${total_annual_div:,.2f}")
             
             avg_yield = (total_annual_div / total_current_val * 100) if total_current_val > 0 else 0.0
-            m4.metric("평균 배당수익률 (현재가 기준)", f"{avg_yield:.2f}%")
+            m4.metric("평균 배당수익률 (현재가)", f"{avg_yield:.2f}%")
             
             st.divider()
             
-            # 보유 종목 상세 내역 테이블
+            # 보유 종목 상세 내역 테이블 (단일 행 선택 활성화)
             pf_display_df = pd.DataFrame(rows)
-            st.dataframe(
+            event_pf = st.dataframe(
                 pf_display_df,
                 width="stretch",
                 hide_index=True,
@@ -1340,58 +1604,331 @@ elif st.session_state.menu == "💼 내 투자 관리":
                     "수익률 (%)": st.column_config.NumberColumn("수익률 (%)", format="%+.2f%%"),
                     "예상 연간 배당금 ($)": st.column_config.NumberColumn("예상 연간 배당금", format="$%.2f"),
                     "배당수익률(평단 기준)": st.column_config.NumberColumn("배당수익률(평단)", format="%.2f%%")
-                }
+                },
+                selection_mode="single-row",
+                on_select="rerun",
+                key="pf_dataframe"
             )
             
-            # 관리 및 연계
-            st.subheader("⚙️ 포트폴리오 자산 개별 제어")
-            col_sel, col_del = st.columns([3, 1])
-            with col_sel:
-                sel_ticker = st.selectbox("분석 차트로 이동할 자산 선택", ["선택 안 함"] + pf_tickers)
-                if sel_ticker != "선택 안 함":
-                    st.session_state.ticker = sel_ticker
-                    st.session_state.menu = "📊 개별 종목 분석"
-                    st.rerun()
-            with col_del:
-                del_ticker = st.selectbox("포트폴리오에서 삭제할 자산 선택", ["선택 안 함"] + pf_tickers)
-                if del_ticker != "선택 안 함":
-                    if st.button("🗑️ 선택 자산 삭제", width="stretch"):
-                        sh.remove_from_portfolio(del_ticker)
-                        st.cache_data.clear()
-                        st.success(f"{del_ticker} 삭제 성공!")
+            # 선택된 자산에 대한 제어 패널
+            selected_rows = event_pf.selection.rows
+            if selected_rows:
+                selected_idx = selected_rows[0]
+                if selected_idx < len(pf_display_df):
+                    sel_ticker = pf_display_df.iloc[selected_idx]['티커']
+                    sel_row = portfolio_df[portfolio_df['symbol'] == sel_ticker].iloc[0]
+                    sel_shares = float(sel_row['shares'])
+                    sel_price = float(sel_row['purchase_price'])
+                    sel_reason = str(sel_row['entry_reason']) if pd.notna(sel_row['entry_reason']) else ""
+                    sel_pos = str(sel_row.get('position_type', 'LONG')).upper()
+                    
+                    st.subheader(f"⚙️ 선택된 포지션 제어: {sel_ticker} ({sel_pos})")
+                    if sel_reason:
+                        st.info(f"💬 **진입 근거 (메모)**: {sel_reason}")
+                
+                c_act1, c_act2, c_act3 = st.columns(3)
+                with c_act1:
+                    if st.button("📊 상세 분석 차트로 이동", use_container_width=True, key="pf_goto_chart_btn", type="primary"):
+                        st.session_state.ticker = sel_ticker
+                        st.session_state.menu = "📊 개별 종목 분석"
                         st.rerun()
+                with c_act2:
+                    with st.popover("➕ 포지션 추가 매수 / 수정", use_container_width=True):
+                        with st.form("pf_tab_buy_form", clear_on_submit=True):
+                            pos_in = st.selectbox("포지션 구분", ["LONG", "SHORT"], index=0 if sel_pos == "LONG" else 1, key="pf_tab_pos_sel")
+                            shares_in = st.number_input("조정 후 총 수량 (주)", min_value=0.0, value=sel_shares, step=1.0)
+                            price_in = st.number_input("수정된 평단가 ($)", min_value=0.0, value=sel_price, step=0.01)
+                            reason_in = st.text_area("메모 / 진입 근거", value=sel_reason, height=80)
+                            buy_submit = st.form_submit_button("포지션 업데이트", width="stretch")
+                            if buy_submit:
+                                if shares_in > 0:
+                                    sh.save_portfolio(sel_ticker, shares_in, price_in, reason_in, pos_in)
+                                    st.cache_data.clear()
+                                    st.success("수정이 완료되었습니다!")
+                                    st.rerun()
+                with c_act3:
+                    with st.popover("🗑️ 포지션 청산 (매도)", use_container_width=True):
+                        with st.form("pf_tab_sell_form", clear_on_submit=True):
+                            sell_shares = st.number_input("청산 수량 (주)", min_value=0.0, max_value=sel_shares, value=sel_shares, step=1.0)
+                            sell_price = st.number_input("매도 청산 단가 ($)", min_value=0.0, value=close_prices.get(sel_ticker, sel_price), step=0.01)
+                            exit_reason = st.text_area("청산 사유 / 기록", value="", height=80)
+                            sell_submit = st.form_submit_button("청산 실행", width="stretch")
+                            if sell_submit:
+                                if sell_shares > 0:
+                                    sh.liquidate_portfolio(sel_ticker, sell_shares, sell_price, exit_reason)
+                                    st.cache_data.clear()
+                                    st.success("포지션 청산이 실행되었습니다.")
+                                    st.rerun()
+            else:
+                st.info("💡 위의 포트폴리오 표에서 자산 행을 클릭하시면 즉시 상세 차트 분석 이동 및 추가 매수/청산 처리를 할 수 있는 제어 패널이 나타납니다.")
 
+    # ------------------ Tab 2: 관심 종목 & 그룹 ------------------
     with tab_wl:
         st.subheader("⭐ 내 관심 종목 목록")
-        watchlist = get_watchlist_cached()
+        watchlist_details = get_watchlist_details_cached()
         
-        if not watchlist:
-            st.info("관심 등록된 종목이 없습니다. '📊 개별 종목 분석' 페이지에서 추가해 주세요.")
+        if watchlist_details.empty:
+            st.info("관심 등록된 종목이 없습니다. 사이드바 검색창이나 우측 그룹 관리를 통해 추가해 주세요.")
         else:
-            watchlist_df = stocks_df[stocks_df['symbol'].isin(watchlist)]
-            if watchlist_df.empty:
-                st.info("관심 등록한 종목이 있지만 마스터 종목 정보에 존재하지 않습니다.")
+            # stocks_df의 중복 티커 제거하여 조인 시 행이 폭발적으로 늘어나는 버그 해결
+            stocks_unique_df = stocks_df.drop_duplicates(subset=['symbol'])
+            
+            # 관심 목록 상세 테이블 생성 (마스터 정보 조인)
+            wl_display_df = watchlist_details.merge(stocks_unique_df, on='symbol', how='left')
+            wl_display_df['companyName'] = wl_display_df['companyName'].fillna("").astype(str)
+            wl_display_df['lastDividend'] = pd.to_numeric(wl_display_df['lastDividend'], errors='coerce').fillna(0.0)
+            wl_display_df['stock_type'] = wl_display_df['stock_type'].fillna("STOCK").astype(str).str.upper()
+            
+            # 관심 그룹 필터
+            all_wl_groups = sorted(wl_display_df['group_name'].dropna().unique().tolist())
+            wl_group_filter = st.selectbox("관심 그룹별 필터", ["전체"] + all_wl_groups, key="wl_group_filter_box")
+            
+            if wl_group_filter != "전체":
+                wl_filtered_df = wl_display_df[wl_display_df['group_name'] == wl_group_filter]
             else:
-                wl_display = watchlist_df.copy().rename(columns={
-                    'symbol': '티커',
-                    'companyName': '회사명',
-                    'lastDividend': '최근 주당 배당금 ($)',
-                    'stock_type': '자산 분류',
-                    'updated_at': '마지막 동기화'
+                wl_filtered_df = wl_display_df
+                
+            wl_rows = []
+            for _, row in wl_filtered_df.iterrows():
+                sym = row['symbol']
+                grp = row['group_name']
+                name = row['companyName'] if row['companyName'] else sym
+                last_div = float(row['lastDividend'])
+                annual_div_per_share = last_div * 4
+                asset_type = row['stock_type']
+                
+                wl_rows.append({
+                    '티커': sym,
+                    '관심 그룹': grp,
+                    '회사명': name,
+                    '최근 주당 배당금 ($)': last_div,
+                    '예상 연배당금 ($)': annual_div_per_share,
+                    '자산 분류': asset_type
+                })
+            
+            wl_table_df = pd.DataFrame(wl_rows)
+            
+            # 관심 목록 데이터프레임 렌더링 (단일 행 선택 모드)
+            event_wl = st.dataframe(
+                wl_table_df,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "최근 주당 배당금 ($)": st.column_config.NumberColumn("주당 배당금 (분기)", format="$%.4f"),
+                    "예상 연배당금 ($)": st.column_config.NumberColumn("연 환산 배당금", format="$%.4f")
+                },
+                selection_mode="single-row",
+                on_select="rerun",
+                key="wl_dataframe_table"
+            )
+            
+            selected_wl_rows = event_wl.selection.rows
+            if selected_wl_rows:
+                selected_idx = selected_wl_rows[0]
+                if selected_idx < len(wl_table_df):
+                    sel_ticker = wl_table_df.iloc[selected_idx]['티커']
+                    sel_group = wl_table_df.iloc[selected_idx]['관심 그룹']
+                    
+                    st.subheader(f"⚙️ 선택된 관심종목 제어: {sel_ticker}")
+                    wl_comment = get_comment_cached(sel_ticker)
+                    if wl_comment:
+                        st.info(f"💬 **관심 종목 코멘트**: {wl_comment}")
+                
+                c_wl_act1, c_wl_act2, c_wl_act3, c_wl_act4 = st.columns(4)
+                
+                with c_wl_act1:
+                    if st.button("📊 상세 차트 분석 이동", use_container_width=True, key="wl_tab_goto_chart", type="primary"):
+                        st.session_state.ticker = sel_ticker
+                        st.session_state.menu = "📊 개별 종목 분석"
+                        st.rerun()
+                        
+                with c_wl_act2:
+                    with st.popover("🎯 조건부 타겟 설정", use_container_width=True):
+                        with st.form("wl_tab_alert_form", clear_on_submit=True):
+                            st.write(f"🎯 {sel_ticker} 타겟 가격 알림 설정")
+                            cond_in = st.text_input("조건식 입력 (예: >= 150)", value=">= 100.0")
+                            al_submit = st.form_submit_button("알림 추가")
+                            if al_submit:
+                                import re
+                                cond_in = cond_in.strip()
+                                match = re.match(r"^([><]=?|==)\s*([0-9.]+)", cond_in)
+                                if match:
+                                    operator = match.group(1)
+                                    target_val = float(match.group(2))
+                                    sh.save_alert(sel_ticker, target_val, operator)
+                                    st.cache_data.clear()
+                                    st.success(f"{sel_ticker} 타겟 알림 설정 완료!")
+                                    st.rerun()
+                                else:
+                                    st.error("형식이 올바르지 않습니다. (예: >= 150)")
+                                    
+                with c_wl_act3:
+                    with st.popover("💼 포트폴리오 등록 (매수)", use_container_width=True):
+                        with st.form("wl_tab_pf_form", clear_on_submit=True):
+                            st.write(f"💼 {sel_ticker} 포트폴리오 등록")
+                            pos_in = st.selectbox("포지션", ["LONG", "SHORT"], key="wl_tab_pos_sel")
+                            shares_in = st.number_input("매수 수량 (주)", min_value=0.0, value=10.0, step=1.0)
+                            price_in = st.number_input("평균 매수가 ($)", min_value=0.0, value=100.0, step=0.01)
+                            reason_in = st.text_area("매수 사유", value="", height=80)
+                            pf_add_submit = st.form_submit_button("포트폴리오에 자산 추가")
+                            if pf_add_submit:
+                                if shares_in > 0:
+                                    sh.save_portfolio(sel_ticker, shares_in, price_in, reason_in, pos_in)
+                                    st.cache_data.clear()
+                                    st.success(f"{sel_ticker} 포트폴리오 추가 완료!")
+                                    st.rerun()
+                                    
+                with c_wl_act4:
+                    if st.button("🗑️ 관심 해제", use_container_width=True, key="wl_tab_remove_btn"):
+                        sh.remove_from_watchlist(sel_ticker, sel_group)
+                        st.cache_data.clear()
+                        st.success(f"{sel_ticker} 관심 해제 완료 (그룹: {sel_group})!")
+                        st.rerun()
+                        
+                # 관심 그룹 이동/변경 위젯
+                with st.expander("📁 관심 그룹 이동/변경 및 신규 추가"):
+                    with st.form("wl_group_change_form", clear_on_submit=True):
+                        new_grp_select = st.selectbox("이동할 그룹 선택", all_wl_groups + ["+ 새 그룹 추가..."])
+                        new_grp_text = ""
+                        if new_grp_select == "+ 새 그룹 추가...":
+                            new_grp_text = st.text_input("새 그룹 이름 입력", "").strip()
+                        
+                        grp_change_submit = st.form_submit_button("관심 그룹 변경 적용")
+                        if grp_change_submit:
+                            target_group = new_grp_text if new_grp_select == "+ 새 그룹 추가..." else new_grp_select
+                            if target_group:
+                                sh.remove_from_watchlist(sel_ticker, sel_group)
+                                sh.add_to_watchlist(sel_ticker, target_group)
+                                st.cache_data.clear()
+                                st.success(f"{sel_ticker}의 관심 그룹이 '{sel_group}'에서 '{target_group}'으로 변경되었습니다.")
+                                st.rerun()
+                            else:
+                                st.error("그룹 이름을 입력해 주세요.")
+            else:
+                st.info("💡 위의 관심 종목 표에서 종목 행을 클릭하시면 차트 이동, 알림 등록, 자산 매수(포폴 등록), 관심 해제 등의 단축 연동 제어가 가능합니다.")
+
+        # 관심 그룹 추가 및 관리
+        with st.expander("📁 관심 그룹 신규 생성 및 정리"):
+            with st.form("wl_new_group_form"):
+                st.markdown("**새 관심 그룹 및 종목 동시 생성**")
+                g_ticker = st.text_input("그룹에 최초 등록할 종목 티커 입력 (예: APPL)", "").strip().upper()
+                g_name = st.text_input("새로 생성할 그룹 이름 입력", "").strip()
+                g_submit = st.form_submit_button("그룹 생성 및 종목 배정")
+                if g_submit:
+                    if g_ticker and g_name:
+                        sh.add_to_watchlist(g_ticker, g_name)
+                        st.cache_data.clear()
+                        st.success(f"새 관심 그룹 '{g_name}'에 '{g_ticker}' 등록 완료!")
+                        st.rerun()
+                    else:
+                        st.error("티커와 그룹 이름을 모두 입력해 주세요.")
+
+    # ------------------ Tab 3: 조건부 타겟 ------------------
+    with tab_al:
+        st.subheader("🎯 조건부 타겟 감시 현황")
+        alerts_df = get_alerts_cached()
+        if alerts_df.empty:
+            st.info("감시 중인 조건부 타겟 가격이 없습니다. 사이드바 '종목 신속 조회' 후 개별 분석 페이지에서 등록해 주세요.")
+        else:
+            # 화면 표출용 컬럼 리네임 및 파싱
+            al_display = alerts_df.copy().rename(columns={
+                'symbol': '티커',
+                'target_price': '목표가 ($)',
+                'condition_type': '조건 설정',
+                'is_triggered': '도달 여부',
+                'created_at': '등록 일시'
+            })
+            al_display['도달 여부'] = al_display['도달 여부'].map(lambda x: "🎯 도달완료" if x else "⏳ 대기중")
+            al_display['조건 설정'] = al_display['조건 설정'].map(lambda x: "상승 돌파 (above)" if x == "above" else ("하락 돌파 (below)" if x == "below" else x))
+            
+            event_al = st.dataframe(
+                al_display[['티커', '목표가 ($)', '조건 설정', '도달 여부', '등록 일시']],
+                width="stretch",
+                hide_index=True,
+                selection_mode="single-row",
+                on_select="rerun",
+                key="al_dataframe_table"
+            )
+            
+            # 선택된 알림 제어 패널
+            selected_al_rows = event_al.selection.rows
+            if selected_al_rows:
+                sel_idx = selected_al_rows[0]
+                if sel_idx < len(al_display):
+                    sel_ticker = al_display.iloc[sel_idx]['티커']
+                    sel_cond = alerts_df.iloc[sel_idx]['condition_type']
+                
+                c_al_act1, c_al_act2 = st.columns(2)
+                with c_al_act1:
+                    if st.button("📊 상세 분석 이동", key="al_tab_goto_chart", use_container_width=True):
+                        st.session_state.ticker = sel_ticker
+                        st.session_state.menu = "📊 개별 종목 분석"
+                        st.rerun()
+                with c_al_act2:
+                    if st.button("🗑️ 선택된 알림 삭제", key="al_tab_delete_btn", type="primary", use_container_width=True):
+                        sh.remove_alert(sel_ticker, sel_cond)
+                        st.cache_data.clear()
+                        st.success(f"{sel_ticker} 알림 삭제 완료!")
+                        st.rerun()
+            else:
+                st.info("💡 위의 표에서 알림 행을 선택하시면 즉시 상세 분석으로 이동하거나 개별 삭제 처리를 할 수 있습니다.")
+
+    # ------------------ Tab 4: 매매 기록 ------------------
+    with tab_th:
+        st.subheader("📝 청산 및 매매 완료 기록")
+        history_df = get_trading_history_cached()
+        if history_df.empty:
+            st.info("완료된 포지션 청산(매매) 기록이 아직 없습니다. 포트폴리오 탭이나 개별 종목 탭에서 포지션 청산을 실행해 주세요.")
+        else:
+            # 청산 완료 실현손익 및 수익률 연산
+            rows_hist = []
+            total_profit = 0.0
+            for _, row in history_df.iterrows():
+                sym = row['symbol']
+                shares = float(row['shares'])
+                p_price = float(row['purchase_price'])
+                s_price = float(row['sell_price'])
+                p_type = str(row.get('position_type', 'LONG')).upper()
+                entry_reason = row['entry_reason'] if pd.notna(row['entry_reason']) else ""
+                exit_reason = row['exit_reason'] if pd.notna(row['exit_reason']) else ""
+                trade_date = row['trade_date']
+                
+                if p_type == "SHORT":
+                    profit = shares * (p_price - s_price)
+                else:
+                    profit = shares * (s_price - p_price)
+                    
+                profit_pct = (profit / (shares * p_price) * 100) if p_price > 0 else 0.0
+                total_profit += profit
+                
+                rows_hist.append({
+                    '티커': sym,
+                    '포지션': p_type,
+                    '수량': shares,
+                    '평균 매수가 ($)': p_price,
+                    '매도 청산가 ($)': s_price,
+                    '실현 손익 ($)': profit,
+                    '수익률 (%)': profit_pct,
+                    '진입 근거': entry_reason,
+                    '청산 사유': exit_reason,
+                    '거래일': trade_date
                 })
                 
-                st.dataframe(
-                    wl_display[['티커', '회사명', '최근 주당 배당금 ($)', '자산 분류', '마지막 동기화']],
-                    width="stretch",
-                    hide_index=True,
-                    column_config={
-                        "최근 주당 배당금 ($)": st.column_config.NumberColumn("최근 주당 배당금 ($)", format="$%.4f")
-                    }
-                )
-                
-                wl_sel = st.selectbox("📊 분석 차트로 이동할 관심 종목 선택", ["선택 안 함"] + wl_display['티커'].tolist())
-                if wl_sel != "선택 안 함":
-                    st.session_state.ticker = wl_sel
-                    st.session_state.menu = "📊 개별 종목 분석"
-                    st.rerun()
+            hist_display_df = pd.DataFrame(rows_hist)
+            
+            # 요약 메트릭
+            st.metric("총 누적 실현손익", f"${total_profit:,.2f}", delta=f"{total_profit:+.2f}")
+            st.divider()
+            
+            st.dataframe(
+                hist_display_df,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "평균 매수가 ($)": st.column_config.NumberColumn("평균 매수가", format="$%.2f"),
+                    "매도 청산가 ($)": st.column_config.NumberColumn("청산 단가", format="$%.2f"),
+                    "실현 손익 ($)": st.column_config.NumberColumn("실현 손익", format="$%.2f"),
+                    "수익률 (%)": st.column_config.NumberColumn("수익률 (%)", format="%+.2f%%")
+                }
+            )
 
