@@ -1487,8 +1487,8 @@ div[data-testid="stVerticalBlock"]:has(span.inspector-marker):not(:has(div[data-
                                             nh.add_order_to_journal(page_id, "LONG", added_shares, price_in, "대시보드 추가매수")
                                         
                                         nh.update_position_properties(page_id, avg_price=price_in, shares=shares_in, status="진입중")
-                                  except Exception as ne:
-                                      pass
+                                except Exception as ne:
+                                    pass
                                       
                                 st.cache_data.clear()
                                 st.toast(f"💼 {sel_ticker} {shares_in}주 저장 완료!")
